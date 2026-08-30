@@ -651,6 +651,15 @@ def vnc_status() -> bytes:
         lines.append("    status:    ACTIVE - open the web UI URL above")
     else:
         lines.append(f"    status:    PARTIAL/STOPPED - deploy with: stream {stream_id or '1'}")
+    try:
+        with _S2["lock"]:
+            s2th, s2i = _S2["th"], dict(_S2["info"])
+        if s2th and s2th.is_alive():
+            lines.append("    stream2:  id=%s state=%s %sx%s@%s (%s)" % (
+                s2i.get("id"), s2i.get("state"), s2i.get("w"), s2i.get("h"),
+                s2i.get("fps"), s2i.get("encoder")))
+    except Exception:
+        pass
     return ("\n".join(lines) + "\n").encode() + MARKER
 
 
@@ -791,6 +800,12 @@ def _s2_capture():
     import dxcam
     cam = None
     try:
+        # numpy backend avoids the cv2 dependency (bundle ships the compiled
+        # _numpy_kernels .pyd; cv2 is not included in the wheel bundle).
+        cam = dxcam.create(output_idx=0, output_color="BGR",
+                           processor_backend="numpy")
+    except TypeError:
+        # older dxcam without processor_backend kwarg
         cam = dxcam.create(output_idx=0, output_color="BGR")
     except Exception:
         cam = None
@@ -850,7 +865,6 @@ def _s2_run(target_id: str) -> None:
     """Stream thread: capture -> tiered H.264 -> MPEG-TS on 127.0.0.1:25900+id.
     Encodes only while a viewer is connected; auto-degrades resolution once if
     the encoder cannot keep up with the target frame rate."""
-    import av
     from fractions import Fraction
     stop = _S2["stop"]
     info = _S2["info"]
@@ -861,10 +875,12 @@ def _s2_run(target_id: str) -> None:
                 degraded=False)
 
     try:
-        _s2_load_runtime()
+        _s2_load_runtime()   # bundle on embed runtimes, site-packages on dev
+        import av            # AFTER load_runtime: may come from the bundle
         grab, stop_cam = _s2_capture()
     except Exception as e:
         info.update(state="failed: %s" % e)
+        print("stream2: %s" % e, file=sys.stderr)
         return
 
     try:
@@ -886,6 +902,7 @@ def _s2_run(target_id: str) -> None:
         info.update(state="failed: no usable video encoder in PyAV")
         return
     info["encoder"] = enc_name
+    print("stream2: encoder=%s from %s" % (enc_name, av.__file__), file=sys.stderr)
     info.update(state="ready - waiting for viewer")
 
     while not stop.is_set():
@@ -1041,6 +1058,9 @@ def stream2_status() -> bytes:
         th = _S2["th"]
         info = dict(_S2["info"])
     if not th or not th.is_alive():
+        st = info.get("state")
+        if st and st.startswith("failed"):
+            return ("[*] stream2: not running (last error: %s)\n" % st).encode() + MARKER
         return b"[*] stream2: not running\n" + MARKER
     lines = ["[*] stream2: id=%s state=%s" % (info.get("id", "?"),
                                                info.get("state", "?"))]
