@@ -976,10 +976,22 @@ def _s2_run(target_id: str) -> None:
             break
         if conn is None:
             continue
-        # 30s: this timeout also governs sendall(); with 2s any transient
-        # websockify/browser backpressure raised socket.timeout and killed
-        # the viewer every few seconds (auto-reconnect loop)
-        conn.settimeout(30.0)
+        # No send timeout: a slow viewer (websockify/browser backpressure,
+        # Send-Q filling) must be THROTTLED, not killed - any settimeout also
+        # governs sendall() and raised socket.timeout on stalls, which killed
+        # the viewer every few seconds (connect/disconnect loop). Dead
+        # viewers are detected by TCP keepalive (~30s) instead.
+        conn.settimeout(None)
+        try:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if os.name == "nt":
+                conn.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 15000, 5000))
+            else:
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except OSError:
+            pass
         writer = _S2SockWriter(conn)
         w, h, fps = STREAM2_DEF_W, STREAM2_DEF_H, STREAM2_DEF_FPS
         info.update(state="streaming", viewers=1)
