@@ -676,7 +676,7 @@ def vnc_status() -> bytes:
 
 STREAM2_PORT_BASE = 25900      # local TS listener + VPS tunnel port: 25900 + id
 STREAM2_DIR_NAME = "stream"    # under %USERPROFILE%\.cache
-STREAM2_DEF_W, STREAM2_DEF_H, STREAM2_DEF_FPS = 1280, 720, 30
+STREAM2_DEF_W, STREAM2_DEF_H, STREAM2_DEF_FPS = 1280, 720, 10
 STREAM2_BR_1080P = 4_000_000   # anchor bitrate, scaled by pixel count
 STREAM2_HTTP_PORT = 8000       # bundle server (same port as the VNC files)
 STREAM2_BUNDLE_VER = "v2"      # bundle filename version; bump to force re-download
