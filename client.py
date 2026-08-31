@@ -687,21 +687,58 @@ _S2 = {"th": None, "stop": threading.Event(), "id": None,
 
 class _S2SockWriter:
     """Socket adapter so PyAV can mux MPEG-TS straight to the viewer."""
-    __slots__ = ("sock",)
+    __slots__ = ("sock", "stall_s", "stall_n", "blocked_since",
+                 "_wd_stop", "_wd")
 
     def __init__(self, sock):
         self.sock = sock
+        self.stall_s = 0.0
+        self.stall_n = 0
+        self.blocked_since = None
+        self._wd_stop = threading.Event()
+        self._wd = threading.Thread(target=self._watchdog, daemon=True,
+                                    name="s2-wd")
+        self._wd.start()
+
+    def _watchdog(self):
+        """Sample socket writability every second. sendall() blocks whenever
+        the kernel refuses writes (send buffer full AND peer receive window
+        exhausted). The instant it flips non-writable, the peer chain
+        (browser/websockify/sshd/ssh) has STOPPED READING - that is the start
+        of the freeze. Logs block start and duration."""
+        import select
+        sock = self.sock
+        while not self._wd_stop.wait(1.0):
+            try:
+                _, w, _ = select.select([], [sock], [], 0)
+            except Exception:
+                return
+            if w:
+                if self.blocked_since is not None:
+                    _s2_log("WRITE UNBLOCKED after %.1fs" %
+                            (time.time() - self.blocked_since))
+                    self.blocked_since = None
+            elif self.blocked_since is None:
+                self.blocked_since = time.time()
+                _s2_log("WRITE BLOCKED: kernel refuses writes "
+                        "(peer not draining)")
+
+    def close(self):
+        self._wd_stop.set()
 
     def write(self, b):
         t0 = time.time()
         try:
             self.sock.sendall(b)
         except Exception as e:
+            self._wd_stop.set()
             _s2_log("sendall %dB FAILED: %r" % (len(b), e))
             raise
         dt = time.time() - t0
         if dt > 0.05:
             _s2_log("sendall %dB took %.3fs (backpressure)" % (len(b), dt))
+            self.stall_s += dt
+            self.stall_n += 1
 
 
 def _s2_dir() -> str:
@@ -1040,7 +1077,12 @@ def _s2_run(target_id: str) -> None:
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
-        _s2_log("socket opts: SO_SNDBUF=1MB keepalive=on nodelay=on")
+        try:
+            sndbuf = conn.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+        except OSError:
+            sndbuf = -1
+        _s2_log("socket opts: SO_SNDBUF cfg=1MB actual=%d "
+                "keepalive=on nodelay=on" % sndbuf)
         writer = _S2SockWriter(conn)
         w, h, fps = STREAM2_DEF_W, STREAM2_DEF_H, STREAM2_DEF_FPS
         pts_n = 0   # monotonic PTS counter: never reset at the rate tick
@@ -1067,6 +1109,7 @@ def _s2_run(target_id: str) -> None:
             n_bytes = 0
             none_ct = 0
             pkt_ct = 0
+            first_log = False
             t0 = time.time()
             degrade = False
             try:
@@ -1119,7 +1162,8 @@ def _s2_run(target_id: str) -> None:
                                 n_frames, "gdi" if _use_gdi else "dx",
                                 pkt.size, " KEY" if pkt.is_keyframe else "",
                                 pkt.pts if pkt.pts is not None else "-"))
-                    if n_frames == 0:
+                    if not first_log:
+                        first_log = True
                         _s2_log("first frame -> %d pkt(s)" % n_pkts)
                     elif n_frames < 5 and n_pkts == 0:
                         _s2_log("encode buffered frame %d (0 packets)" % n_frames)
@@ -1128,8 +1172,11 @@ def _s2_run(target_id: str) -> None:
                     now = time.time()
                     if now - t0 >= 5.0:
                         real = n_frames / max(now - t0, 0.001)
-                        _s2_log("stats real=%.1ffps frames=%d bytes=%d" % (
-                            real, n_frames, n_bytes))
+                        _s2_log("stats real=%.1ffps frames=%d bytes=%d "
+                                "writewait=%.1fs/%d" % (
+                                    real, n_frames, n_bytes,
+                                    writer.stall_s, writer.stall_n))
+                        writer.stall_s, writer.stall_n = 0.0, 0
                         info.update(bytes=info.get("bytes", 0) + n_bytes,
                                     frames=info.get("frames", 0) + n_frames)
                         if real < fps * 0.6 and not info.get("degraded")\
@@ -1162,6 +1209,7 @@ def _s2_run(target_id: str) -> None:
                 viewer_dead = True
             _s2_log("session end degrade=%s -> viewer_dead=%s" % (
                 degrade, viewer_dead))
+        writer.close()
         try:
             conn.close()
         except OSError:
