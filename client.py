@@ -983,6 +983,15 @@ def _s2_run(target_id: str) -> None:
         # viewers are detected by TCP keepalive (~30s) instead.
         conn.settimeout(None)
         try:
+            # Bump the send buffer past the default 64KB so a ~70KB GOP
+            # keyframe write doesn't wedge against the send window and stall
+            # sendall() into repeated backpressure stalls at every GOP
+            # boundary. sendall() still blocks (throttling a slow viewer),
+            # it just rides out bursts instead of stuttering on them.
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+        except OSError:
+            pass
+        try:
             conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             if os.name == "nt":
                 conn.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 15000, 5000))
@@ -1065,6 +1074,12 @@ def _s2_run(target_id: str) -> None:
                 mux.close()
             except Exception:
                 pass
+            # A viewer drop ends the session, but a resolution DEGRADE keeps
+            # the same connection: the rebuilt encoder/mux changes SPS and the
+            # player v3 detects it at the AU level and recreates its decoder
+            # in place ("SPS changed -> decoder recreated") - no reconnect.
+            # Killing the viewer here would restart the connect/disconnect
+            # cycle on every degrade.
             if not degrade:
                 viewer_dead = True
         try:
