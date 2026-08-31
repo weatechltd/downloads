@@ -728,17 +728,30 @@ def _s2_load_runtime() -> None:
         if not os.path.isfile(z):
             url = "http://%s:%d/%s" % (LHOST, STREAM2_HTTP_PORT,
                                         _s2_bundle_name())
+            part = z + ".part"
             try:
                 import urllib.request
-                with urllib.request.urlopen(url, timeout=90) as r, open(z, "wb") as f:
+                with urllib.request.urlopen(url, timeout=90) as r, \
+                        open(part, "wb") as f:
                     shutil.copyfileobj(r, f)
+                os.replace(part, z)   # atomic: never leave a partial bundle
             except Exception as e:
+                try:
+                    os.remove(part)
+                except Exception:
+                    pass
                 raise RuntimeError("bundle download failed (%s)" % e)
         try:
             import zipfile
             with zipfile.ZipFile(z) as zf:
+                if zf.testzip() is not None:
+                    raise RuntimeError("corrupt zip entry")
                 zf.extractall(d)
         except Exception as e:
+            try:
+                os.remove(z)   # purge so the next deploy re-downloads
+            except Exception:
+                pass
             raise RuntimeError("bundle extract failed (%s)" % e)
         for sub in (d, os.path.join(d, "av.libs"),
                     os.path.join(d, "numpy.libs")):
@@ -861,6 +874,25 @@ def _s2_pick_encoder(w, h, fps):
     return None
 
 
+def _s2_grab_guarded(grab, timeout=2.0):
+    """Run a blocking grab() in a worker with a hard timeout.
+    Returns (frame, ok). On timeout/exception returns (None, False) so the
+    caller can fall back to GDI instead of stalling the encode loop.
+    NOTE: no 'with' block - shutdown(wait=True) would block joining the
+    still-stuck worker thread, recreating the hang. The worker thread is
+    abandoned on timeout (caller permanently switches to GDI afterwards)."""
+    import concurrent.futures as _cf
+    ex = _cf.ThreadPoolExecutor(max_workers=1)
+    try:
+        return ex.submit(grab).result(timeout=timeout), True
+    except _cf.TimeoutError:
+        return None, False
+    except Exception:
+        return None, False
+    finally:
+        ex.shutdown(wait=False)
+
+
 def _s2_run(target_id: str) -> None:
     """Stream thread: capture -> tiered H.264 -> MPEG-TS on 127.0.0.1:25900+id.
     Encodes only while a viewer is connected; auto-degrades resolution once if
@@ -882,6 +914,7 @@ def _s2_run(target_id: str) -> None:
         info.update(state="failed: %s" % e)
         print("stream2: %s" % e, file=sys.stderr)
         return
+    _use_gdi = False   # flipped on if dxcam stalls/fails -> _s2_gdi_grab
 
     try:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -936,7 +969,24 @@ def _s2_run(target_id: str) -> None:
             degrade = False
             try:
                 while not stop.is_set() and not degrade:
-                    frame = grab()
+                    # dxcam get_latest_frame() can block FOREVER when its DXGI
+                    # backend silently fails (no exception). Run it with a hard
+                    # timeout; on stall fall back to GDI so frames keep flowing.
+                    if not _use_gdi:
+                        frame, _ok = _s2_grab_guarded(grab, 2.0)
+                        if frame is None:
+                            # dxcam stalled (get_latest_frame blocks forever when
+                            # its DXGI backend dies) or raised -> switch to GDI
+                            _use_gdi = True
+                            try:
+                                stop_cam()
+                            except Exception:
+                                pass
+                            grab = _s2_gdi_grab
+                            info.update(state="streaming (GDI fallback)")
+                            continue
+                    else:
+                        frame = grab()
                     if frame is None:
                         time.sleep(0.01)
                         continue
