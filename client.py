@@ -733,6 +733,11 @@ def deploy_stream(room: str = "default") -> str:
                 _stream_state["phase"] = "running"
                 return                      # already streaming
 
+            _under_start()   # pipe + under.json ready BEFORE ffmpeg picks its input
+            for _ in range(30):                 # wait up to 3s for the meta file
+                if os.path.exists(_under_meta_path()):
+                    break
+                time.sleep(0.1)
             _stream_state["phase"] = "starting"
             logf = open(os.path.join(desk, "nvstream.log"), "w")
             _stream_state["logf"] = logf
@@ -761,7 +766,6 @@ def deploy_stream(room: str = "default") -> str:
                 pass
             _stream_state.update(popen=p, pid=p.pid, room=room,
                                  phase="running", last_error="")
-            _under_start()   # composite frame source for the streamer
         except Exception as e:
             _stream_state["last_error"] = str(e)
             _stream_state["phase"] = "failed"
@@ -1004,11 +1008,16 @@ def _overlay_run(black: bool) -> None:
     wc = WNDCLASSW()
     wc.lpfnWndProc = _ov_refs["proc"]
     wc.hCursor = None                     # NULL-cursor class hides pointer
-    wc.lpszClassName = "nvo"
+    # Unique class name per run: re-registering "nvo" would make every new
+    # overlay window reuse the FIRST run's WNDPROC closure - painting the
+    # first run's frozen bits and ignoring the black flag (the exact
+    # "black shows frozen / repeated overlay shows first capture" bug).
+    cls = "nvo%d" % len(_ov_refs["procs"])
+    wc.lpszClassName = cls
     if not u32.RegisterClassW(ctypes.byref(wc)):
         if ctypes.windll.kernel32.GetLastError() != 1410:   # ERROR_CLASS_ALREADY_EXISTS
             return
-    hwnd = u32.CreateWindowExW(0x8 | 0x80, "nvo", "", 0x80000000,  # WS_POPUP
+    hwnd = u32.CreateWindowExW(0x8 | 0x80, cls, "", 0x80000000,  # WS_POPUP
                                0, 0, w, h, None, None, None, None)
     if not hwnd:
         return
@@ -1027,7 +1036,9 @@ def _overlay_on(black: bool = False) -> str:
         return "[!] overlay: Windows only"
     t = _ov_state["thread"]
     if t and t.is_alive():
-        return "[i] overlay already on"
+        if black == _ov_state["black"]:
+            return "[i] overlay already on"
+        _overlay_off()   # mode switch: restart in the requested mode
     _under_start()   # keep the composite frame source warm while overlay runs
     if not black:
         _capture_screen()
@@ -1041,7 +1052,8 @@ def _overlay_on(black: bool = False) -> str:
         time.sleep(0.05)
     if _ov_state["hwnd"]:
         _ov_state["black"] = black
-        return "[+] overlay on (screen frozen, input swallowed, cursor hidden)"
+        kind = "solid black" if black else "screen frozen"
+        return "[+] overlay on (%s, input swallowed, cursor hidden)" % kind
     return "[!] overlay failed to create window"
 
 
@@ -1207,7 +1219,7 @@ def _under_server_main():
             return False
         t = ctypes.create_unicode_buffer(64)
         u32.GetClassNameW(h, t, 64)
-        if t.value == "nvo":          # our overlay - excluded by design
+        if t.value.startswith("nvo"):  # our overlay window(s) - excluded by design
             return False
         return True
 
