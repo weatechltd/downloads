@@ -3311,16 +3311,19 @@ def _keylog_cmd(rest: str) -> str:
 # already claimed by a more specific family.
 
 _CRYPTO_PATTERNS = {
-    "btc":  r"(?:bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{25,80}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})",
-    "eth":  r"0x[a-fA-F0-9]{40}",
-    "bnb":  r"0x[a-fA-F0-9]{40}",
-    "ltc":  r"[LM3][a-km-zA-HJ-NP-Z1-9]{26,33}",
+    "btc":  r"(?:(?i:bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{25,80})|[13][a-km-zA-HJ-NP-Z1-9]{25,34})",
+    "eth":  r"0[xX][a-fA-F0-9]{40}",
+    "bnb":  r"0[xX][a-fA-F0-9]{40}",
+    "ltc":  r"(?:(?i:ltc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{38,80})|[LM3][a-km-zA-HJ-NP-Z1-9]{26,33})",
     "doge": r"D[a-km-zA-HJ-NP-Z1-9]{25,33}",
     "dash": r"X[a-km-zA-HJ-NP-Z1-9]{25,33}",
     "trx":  r"T[1-9A-HJ-NP-Za-km-z]{33}",
-    "bch":  r"(?:q|p)[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{41}",
-    "ada":  r"addr1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58,90}",
-    "zec":  r"(?:t1[a-km-zA-HJ-NP-Z1-9]{25,34}|zs1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{74})",
+    "bch":  r"(?i:(?:q|p)[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{41})",
+    # ada: addr1 data 53 (enterprise 58c) .. 98 (base/delegated 103c);
+    # Byron branches: Ae2 (Icarus) and DdzFF (Daedalus) are case-sensitive
+    # base58; lengths measured from real samples (59c / 104c) + slack.
+    "ada":  r"(?:(?i:addr1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{53,98})|Ae2[a-km-zA-HJ-NP-Z1-9]{50,66}|DdzFF[a-km-zA-HJ-NP-Z1-9]{92,108})",
+    "zec":  r"(?:t1[a-km-zA-HJ-NP-Z1-9]{25,34}|(?i:zs1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{75}))",
     "xmr":  r"[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}",
     "sol":  r"[1-9A-HJ-NP-Za-km-z]{32,44}",
 }
